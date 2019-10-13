@@ -252,6 +252,14 @@ static int connect_setup(struct transport *transport, int for_push)
 	return 0;
 }
 
+static void die_if_server_options(struct transport *transport)
+{
+	if (!transport->server_options || !transport->server_options->nr)
+		return;
+	advise(_("see protocol.version in 'git help config' for more details"));
+	die(_("server options require protocol version 2 or later"));
+}
+
 /*
  * Obtains the protocol version from the transport and writes it to
  * transport->data->version, first connecting if not already connected.
@@ -286,6 +294,7 @@ static struct ref *handshake(struct transport *transport, int for_push,
 		break;
 	case protocol_v1:
 	case protocol_v0:
+		die_if_server_options(transport);
 		get_remote_heads(&reader, &refs,
 				 for_push ? REF_NORMAL : 0,
 				 &data->extra_have,
@@ -314,7 +323,6 @@ static int fetch_refs_via_pack(struct transport *transport,
 	int ret = 0;
 	struct git_transport_data *data = transport->data;
 	struct ref *refs = NULL;
-	char *dest = xstrdup(transport->url);
 	struct fetch_pack_args args;
 	struct ref *refs_tmp = NULL;
 
@@ -356,16 +364,17 @@ static int fetch_refs_via_pack(struct transport *transport,
 
 	switch (data->version) {
 	case protocol_v2:
-		refs = fetch_pack(&args, data->fd, data->conn,
+		refs = fetch_pack(&args, data->fd,
 				  refs_tmp ? refs_tmp : transport->remote_refs,
-				  dest, to_fetch, nr_heads, &data->shallow,
+				  to_fetch, nr_heads, &data->shallow,
 				  &transport->pack_lockfile, data->version);
 		break;
 	case protocol_v1:
 	case protocol_v0:
-		refs = fetch_pack(&args, data->fd, data->conn,
+		die_if_server_options(transport);
+		refs = fetch_pack(&args, data->fd,
 				  refs_tmp ? refs_tmp : transport->remote_refs,
-				  dest, to_fetch, nr_heads, &data->shallow,
+				  to_fetch, nr_heads, &data->shallow,
 				  &transport->pack_lockfile, data->version);
 		break;
 	case protocol_unknown_version:
@@ -389,7 +398,6 @@ static int fetch_refs_via_pack(struct transport *transport,
 
 	free_refs(refs_tmp);
 	free_refs(refs);
-	free(dest);
 	return ret;
 }
 
@@ -1062,6 +1070,7 @@ static int run_pre_push_hook(struct transport *transport,
 
 	proc.argv = argv;
 	proc.in = -1;
+	proc.trace2_hook_name = "pre-push";
 
 	if (start_command(&proc)) {
 		finish_command(&proc);
@@ -1217,6 +1226,20 @@ int transport_push(struct repository *r,
 		err = push_had_errors(remote_refs);
 		ret = push_ret | err;
 
+		if ((flags & TRANSPORT_PUSH_ATOMIC) && err) {
+			struct ref *it;
+			for (it = remote_refs; it; it = it->next)
+				switch (it->status) {
+				case REF_STATUS_NONE:
+				case REF_STATUS_UPTODATE:
+				case REF_STATUS_OK:
+					it->status = REF_STATUS_ATOMIC_PUSH_FAILED;
+					break;
+				default:
+					break;
+				}
+		}
+
 		if (!quiet || err)
 			transport_print_push_status(transport->url, remote_refs,
 					verbose | porcelain, porcelain,
@@ -1370,101 +1393,4 @@ char *transport_anonymize_url(const char *url)
 		       (int)anon_len, anon_part);
 literal_copy:
 	return xstrdup(url);
-}
-
-static void fill_alternate_refs_command(struct child_process *cmd,
-					const char *repo_path)
-{
-	const char *value;
-
-	if (!git_config_get_value("core.alternateRefsCommand", &value)) {
-		cmd->use_shell = 1;
-
-		argv_array_push(&cmd->args, value);
-		argv_array_push(&cmd->args, repo_path);
-	} else {
-		cmd->git_cmd = 1;
-
-		argv_array_pushf(&cmd->args, "--git-dir=%s", repo_path);
-		argv_array_push(&cmd->args, "for-each-ref");
-		argv_array_push(&cmd->args, "--format=%(objectname)");
-
-		if (!git_config_get_value("core.alternateRefsPrefixes", &value)) {
-			argv_array_push(&cmd->args, "--");
-			argv_array_split(&cmd->args, value);
-		}
-	}
-
-	cmd->env = local_repo_env;
-	cmd->out = -1;
-}
-
-static void read_alternate_refs(const char *path,
-				alternate_ref_fn *cb,
-				void *data)
-{
-	struct child_process cmd = CHILD_PROCESS_INIT;
-	struct strbuf line = STRBUF_INIT;
-	FILE *fh;
-
-	fill_alternate_refs_command(&cmd, path);
-
-	if (start_command(&cmd))
-		return;
-
-	fh = xfdopen(cmd.out, "r");
-	while (strbuf_getline_lf(&line, fh) != EOF) {
-		struct object_id oid;
-		const char *p;
-
-		if (parse_oid_hex(line.buf, &oid, &p) || *p) {
-			warning(_("invalid line while parsing alternate refs: %s"),
-				line.buf);
-			break;
-		}
-
-		cb(&oid, data);
-	}
-
-	fclose(fh);
-	finish_command(&cmd);
-}
-
-struct alternate_refs_data {
-	alternate_ref_fn *fn;
-	void *data;
-};
-
-static int refs_from_alternate_cb(struct object_directory *e,
-				  void *data)
-{
-	struct strbuf path = STRBUF_INIT;
-	size_t base_len;
-	struct alternate_refs_data *cb = data;
-
-	if (!strbuf_realpath(&path, e->path, 0))
-		goto out;
-	if (!strbuf_strip_suffix(&path, "/objects"))
-		goto out;
-	base_len = path.len;
-
-	/* Is this a git repository with refs? */
-	strbuf_addstr(&path, "/refs");
-	if (!is_directory(path.buf))
-		goto out;
-	strbuf_setlen(&path, base_len);
-
-	read_alternate_refs(path.buf, cb->fn, cb->data);
-
-out:
-	strbuf_release(&path);
-	return 0;
-}
-
-void for_each_alternate_ref(alternate_ref_fn fn, void *data)
-{
-	struct alternate_refs_data cb;
-	cb.fn = fn;
-	cb.data = data;
-	foreach_alt_odb(refs_from_alternate_cb, &cb);
 }

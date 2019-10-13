@@ -12,7 +12,7 @@ case "$jobname" in
 linux-clang|linux-gcc)
 	sudo apt-add-repository -y "ppa:ubuntu-toolchain-r/test"
 	sudo apt-get -q update
-	sudo apt-get -q -y install language-pack-is git-svn apache2
+	sudo apt-get -q -y install language-pack-is libsvn-perl apache2
 	case "$jobname" in
 	linux-gcc)
 		sudo apt-get -q -y install gcc-8
@@ -34,7 +34,7 @@ linux-clang|linux-gcc)
 	popd
 	;;
 osx-clang|osx-gcc)
-	brew update >/dev/null
+	export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
 	# Uncomment this if you want to run perf tests:
 	# brew install gnu-time
 	test -z "$BREW_INSTALL_PACKAGES" ||
@@ -54,6 +54,9 @@ StaticAnalysis)
 Documentation)
 	sudo apt-get -q update
 	sudo apt-get -q -y install asciidoc xmlto
+
+	test -n "$ALREADY_HAVE_ASCIIDOCTOR" ||
+	gem install --version 1.5.8 asciidoctor
 	;;
 esac
 

@@ -25,16 +25,14 @@ try_local_x () {
 	echo "$x"
 }
 
-# This test is an experiment to check whether any Git users are using
-# Shells that don't support the "local" keyword. "local" is not
+# Check whether the shell supports the "local" keyword. "local" is not
 # POSIX-standard, but it is very widely supported by POSIX-compliant
-# shells, and if it doesn't cause problems for people, we would like
-# to be able to use it in Git code.
+# shells, and we rely on it within Git's test framework.
 #
-# For now, this is the only test that requires "local". If your shell
-# fails this test, you can ignore the failure, but please report the
-# problem to the Git mailing list <git@vger.kernel.org>, as it might
-# convince us to continue avoiding the use of "local".
+# If your shell fails this test, the results of other tests may be
+# unreliable. You may wish to report the problem to the Git mailing
+# list <git@vger.kernel.org>, as it could cause us to reconsider
+# relying on "local".
 test_expect_success 'verify that the running shell supports "local"' '
 	x="notlocal" &&
 	echo "local" >expected1 &&
@@ -726,7 +724,7 @@ donthaveit=yes
 test_expect_success DONTHAVEIT 'unmet prerequisite causes test to be skipped' '
 	donthaveit=no
 '
-if test $haveit$donthaveit != yesyes
+if test -z "$GIT_TEST_FAIL_PREREQS_INTERNAL" -a $haveit$donthaveit != yesyes
 then
 	say "bug in test framework: prerequisite tags do not work reliably"
 	exit 1
@@ -747,7 +745,7 @@ donthaveiteither=yes
 test_expect_success DONTHAVEIT,HAVEIT 'unmet prerequisites causes test to be skipped' '
 	donthaveiteither=no
 '
-if test $haveit$donthaveit$donthaveiteither != yesyesyes
+if test -z "$GIT_TEST_FAIL_PREREQS_INTERNAL" -a $haveit$donthaveit$donthaveiteither != yesyesyes
 then
 	say "bug in test framework: multiple prerequisite tags do not work reliably"
 	exit 1
@@ -763,7 +761,7 @@ test_expect_success !LAZY_TRUE 'missing lazy prereqs skip tests' '
 	donthavetrue=no
 '
 
-if test "$havetrue$donthavetrue" != yesyes
+if test -z "$GIT_TEST_FAIL_PREREQS_INTERNAL" -a "$havetrue$donthavetrue" != yesyes
 then
 	say 'bug in test framework: lazy prerequisites do not work'
 	exit 1
@@ -779,7 +777,7 @@ test_expect_success LAZY_FALSE 'missing negative lazy prereqs will skip' '
 	havefalse=no
 '
 
-if test "$nothavefalse$havefalse" != yesyes
+if test -z "$GIT_TEST_FAIL_PREREQS_INTERNAL" -a "$nothavefalse$havefalse" != yesyes
 then
 	say 'bug in test framework: negative lazy prerequisites do not work'
 	exit 1
@@ -790,7 +788,7 @@ test_expect_success 'tests clean up after themselves' '
 	test_when_finished clean=yes
 '
 
-if test $clean != yes
+if test -z "$GIT_TEST_FAIL_PREREQS_INTERNAL" -a $clean != yes
 then
 	say "bug in test framework: basic cleanup command does not work reliably"
 	exit 1
@@ -823,6 +821,24 @@ test_expect_success 'tests clean up even on failures' "
 	> # failed 2 among 2 test(s)
 	> 1..2
 	EOF
+"
+
+test_expect_success 'test_atexit is run' "
+	test_must_fail run_sub_test_lib_test \
+		atexit-cleanup 'Run atexit commands' -i <<-\\EOF &&
+	test_expect_success 'tests clean up even after a failure' '
+		> ../../clean-atexit &&
+		test_atexit rm ../../clean-atexit &&
+		> ../../also-clean-atexit &&
+		test_atexit rm ../../also-clean-atexit &&
+		> ../../dont-clean-atexit &&
+		(exit 1)
+	'
+	test_done
+	EOF
+	test_path_is_file dont-clean-atexit &&
+	test_path_is_missing clean-atexit &&
+	test_path_is_missing also-clean-atexit
 "
 
 test_expect_success 'test_oid setup' '

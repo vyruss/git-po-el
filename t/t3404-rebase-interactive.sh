@@ -75,11 +75,10 @@ test_expect_success 'rebase --keep-empty' '
 	test_line_count = 6 actual
 '
 
-cat > expect <<EOF
-error: nothing to do
-EOF
-
 test_expect_success 'rebase -i with empty HEAD' '
+	cat >expect <<-\EOF &&
+	error: nothing to do
+	EOF
 	set_fake_editor &&
 	test_must_fail env FAKE_LINES="1 exec_true" git rebase -i HEAD^ >actual 2>&1 &&
 	test_i18ncmp expect actual
@@ -149,12 +148,10 @@ test_expect_success 'rebase -i with the exec command checks tree cleanness' '
 
 test_expect_success 'rebase -x with empty command fails' '
 	test_when_finished "git rebase --abort ||:" &&
-	test_must_fail env GIT_TEST_REBASE_USE_BUILTIN=true \
-		git rebase -x "" @ 2>actual &&
+	test_must_fail env git rebase -x "" @ 2>actual &&
 	test_write_lines "error: empty exec command" >expected &&
 	test_i18ncmp expected actual &&
-	test_must_fail env GIT_TEST_REBASE_USE_BUILTIN=true \
-		git rebase -x " " @ 2>actual &&
+	test_must_fail env git rebase -x " " @ 2>actual &&
 	test_i18ncmp expected actual
 '
 
@@ -162,8 +159,7 @@ LF='
 '
 test_expect_success 'rebase -x with newline in command fails' '
 	test_when_finished "git rebase --abort ||:" &&
-	test_must_fail env GIT_TEST_REBASE_USE_BUILTIN=true \
-		git rebase -x "a${LF}b" @ 2>actual &&
+	test_must_fail env git rebase -x "a${LF}b" @ 2>actual &&
 	test_write_lines "error: exec commands cannot contain newlines" \
 			 >expected &&
 	test_i18ncmp expected actual
@@ -240,25 +236,23 @@ test_expect_success 'exchange two commits' '
 	test G = $(git cat-file commit HEAD | sed -ne \$p)
 '
 
-cat > expect << EOF
-diff --git a/file1 b/file1
-index f70f10e..fd79235 100644
---- a/file1
-+++ b/file1
-@@ -1 +1 @@
--A
-+G
-EOF
-
-cat > expect2 << EOF
-<<<<<<< HEAD
-D
-=======
-G
->>>>>>> 5d18e54... G
-EOF
-
 test_expect_success 'stop on conflicting pick' '
+	cat >expect <<-\EOF &&
+	diff --git a/file1 b/file1
+	index f70f10e..fd79235 100644
+	--- a/file1
+	+++ b/file1
+	@@ -1 +1 @@
+	-A
+	+G
+	EOF
+	cat >expect2 <<-\EOF &&
+	<<<<<<< HEAD
+	D
+	=======
+	G
+	>>>>>>> 5d18e54... G
+	EOF
 	git tag new-branch1 &&
 	set_fake_editor &&
 	test_must_fail git rebase -i master &&
@@ -498,15 +492,14 @@ test_expect_success 'commit message retained after conflict' '
 	git branch -D conflict-squash
 '
 
-cat > expect-squash-fixup << EOF
-B
-
-D
-
-ONCE
-EOF
-
 test_expect_success C_LOCALE_OUTPUT 'squash and fixup generate correct log messages' '
+	cat >expect-squash-fixup <<-\EOF &&
+	B
+
+	D
+
+	ONCE
+	EOF
 	git checkout -b squash-fixup E &&
 	base=$(git rev-parse HEAD~4) &&
 	set_fake_editor &&
@@ -802,13 +795,12 @@ test_expect_success 'rebase -i can copy notes' '
 	test "a note" = "$(git notes show HEAD)"
 '
 
-cat >expect <<EOF
-an earlier note
-
-a note
-EOF
-
 test_expect_success 'rebase -i can copy notes over a fixup' '
+	cat >expect <<-\EOF &&
+	an earlier note
+
+	a note
+	EOF
 	git reset --hard n3 &&
 	git notes add -m"an earlier note" n2 &&
 	set_fake_editor &&
@@ -1034,7 +1026,7 @@ test_expect_success 'rebase -i --root reword root commit' '
 	test -z "$(git show -s --format=%p HEAD^)"
 '
 
-test_expect_success 'rebase -i --root when root has untracked file confilct' '
+test_expect_success 'rebase -i --root when root has untracked file conflict' '
 	test_when_finished "reset_rebase" &&
 	git checkout -b failing-root-pick A &&
 	echo x >file2 &&
@@ -1307,52 +1299,37 @@ test_expect_success 'rebase -i respects rebase.missingCommitsCheck = ignore' '
 		actual
 '
 
-cat >expect <<EOF
-Warning: some commits may have been dropped accidentally.
-Dropped commits (newer to older):
- - $(git rev-list --pretty=oneline --abbrev-commit -1 master)
-To avoid this message, use "drop" to explicitly remove a commit.
-
-Use 'git config rebase.missingCommitsCheck' to change the level of warnings.
-The possible behaviours are: ignore, warn, error.
-
-Rebasing (1/4)
-Rebasing (2/4)
-Rebasing (3/4)
-Rebasing (4/4)
-Successfully rebased and updated refs/heads/missing-commit.
-EOF
-
-cr_to_nl () {
-	tr '\015' '\012'
-}
-
 test_expect_success 'rebase -i respects rebase.missingCommitsCheck = warn' '
+	cat >expect <<-EOF &&
+	Warning: some commits may have been dropped accidentally.
+	Dropped commits (newer to older):
+	 - $(git rev-list --pretty=oneline --abbrev-commit -1 master)
+	To avoid this message, use "drop" to explicitly remove a commit.
+	EOF
 	test_config rebase.missingCommitsCheck warn &&
 	rebase_setup_and_clean missing-commit &&
 	set_fake_editor &&
 	FAKE_LINES="1 2 3 4" \
 		git rebase -i --root 2>actual.2 &&
-	cr_to_nl <actual.2 >actual &&
+	head -n4 actual.2 >actual &&
 	test_i18ncmp expect actual &&
 	test D = $(git cat-file commit HEAD | sed -ne \$p)
 '
 
-cat >expect <<EOF
-Warning: some commits may have been dropped accidentally.
-Dropped commits (newer to older):
- - $(git rev-list --pretty=oneline --abbrev-commit -1 master)
- - $(git rev-list --pretty=oneline --abbrev-commit -1 master~2)
-To avoid this message, use "drop" to explicitly remove a commit.
-
-Use 'git config rebase.missingCommitsCheck' to change the level of warnings.
-The possible behaviours are: ignore, warn, error.
-
-You can fix this with 'git rebase --edit-todo' and then run 'git rebase --continue'.
-Or you can abort the rebase with 'git rebase --abort'.
-EOF
-
 test_expect_success 'rebase -i respects rebase.missingCommitsCheck = error' '
+	cat >expect <<-EOF &&
+	Warning: some commits may have been dropped accidentally.
+	Dropped commits (newer to older):
+	 - $(git rev-list --pretty=oneline --abbrev-commit -1 master)
+	 - $(git rev-list --pretty=oneline --abbrev-commit -1 master~2)
+	To avoid this message, use "drop" to explicitly remove a commit.
+
+	Use '\''git config rebase.missingCommitsCheck'\'' to change the level of warnings.
+	The possible behaviours are: ignore, warn, error.
+
+	You can fix this with '\''git rebase --edit-todo'\'' and then run '\''git rebase --continue'\''.
+	Or you can abort the rebase with '\''git rebase --abort'\''.
+	EOF
 	test_config rebase.missingCommitsCheck error &&
 	rebase_setup_and_clean missing-commit &&
 	set_fake_editor &&

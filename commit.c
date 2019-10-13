@@ -57,10 +57,9 @@ struct commit *lookup_commit_or_die(const struct object_id *oid, const char *ref
 
 struct commit *lookup_commit(struct repository *r, const struct object_id *oid)
 {
-	struct object *obj = lookup_object(r, oid->hash);
+	struct object *obj = lookup_object(r, oid);
 	if (!obj)
-		return create_object(r, oid->hash,
-				     alloc_commit_node(r));
+		return create_object(r, oid, alloc_commit_node(r));
 	return object_as_type(r, obj, OBJ_COMMIT, 0);
 }
 
@@ -340,15 +339,21 @@ void free_commit_buffer(struct parsed_object_pool *pool, struct commit *commit)
 	}
 }
 
-struct tree *get_commit_tree(const struct commit *commit)
+static inline void set_commit_tree(struct commit *c, struct tree *t)
+{
+	c->maybe_tree = t;
+}
+
+struct tree *repo_get_commit_tree(struct repository *r,
+				  const struct commit *commit)
 {
 	if (commit->maybe_tree || !commit->object.parsed)
 		return commit->maybe_tree;
 
-	if (commit->graph_pos == COMMIT_NOT_FROM_GRAPH)
-		BUG("commit has NULL tree, but was not loaded from commit-graph");
+	if (commit->graph_pos != COMMIT_NOT_FROM_GRAPH)
+		return get_commit_tree_in_graph(r, commit);
 
-	return get_commit_tree_in_graph(the_repository, commit);
+	return NULL;
 }
 
 struct object_id *get_commit_tree_oid(const struct commit *commit)
@@ -358,7 +363,7 @@ struct object_id *get_commit_tree_oid(const struct commit *commit)
 
 void release_commit_memory(struct parsed_object_pool *pool, struct commit *c)
 {
-	c->maybe_tree = NULL;
+	set_commit_tree(c, NULL);
 	c->index = 0;
 	free_commit_buffer(pool, c);
 	free_commit_list(c->parents);
@@ -406,7 +411,7 @@ int parse_commit_buffer(struct repository *r, struct commit *item, const void *b
 	if (get_oid_hex(bufptr + 5, &parent) < 0)
 		return error("bad tree pointer in commit %s",
 			     oid_to_hex(&item->object.oid));
-	item->maybe_tree = lookup_tree(r, &parent);
+	set_commit_tree(item, lookup_tree(r, &parent));
 	bufptr += tree_entry_len + 1; /* "tree " + "hex sha1" + "\n" */
 	pptr = &item->parents;
 
@@ -443,7 +448,7 @@ int parse_commit_buffer(struct repository *r, struct commit *item, const void *b
 	item->date = parse_commit_date(bufptr, tail);
 
 	if (check_graph)
-		load_commit_graph_info(the_repository, item);
+		load_commit_graph_info(r, item);
 
 	return 0;
 }

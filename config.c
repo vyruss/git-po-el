@@ -19,6 +19,7 @@
 #include "utf8.h"
 #include "dir.h"
 #include "color.h"
+#include "refs.h"
 
 struct config_source {
 	struct config_source *prev;
@@ -170,6 +171,12 @@ static int handle_path_include(const char *path, struct config_include_data *inc
 	return ret;
 }
 
+static void add_trailing_starstar_for_dir(struct strbuf *pat)
+{
+	if (pat->len && is_dir_sep(pat->buf[pat->len - 1]))
+		strbuf_addstr(pat, "**");
+}
+
 static int prepare_include_condition_pattern(struct strbuf *pat)
 {
 	struct strbuf path = STRBUF_INIT;
@@ -199,8 +206,7 @@ static int prepare_include_condition_pattern(struct strbuf *pat)
 	} else if (!is_absolute_path(pat->buf))
 		strbuf_insert(pat, 0, "**/", 3);
 
-	if (pat->len && is_dir_sep(pat->buf[pat->len - 1]))
-		strbuf_addstr(pat, "**");
+	add_trailing_starstar_for_dir(pat);
 
 	strbuf_release(&path);
 	return prefix;
@@ -242,7 +248,7 @@ again:
 	}
 
 	ret = !wildmatch(pattern.buf + prefix, text.buf + prefix,
-			 icase ? WM_CASEFOLD : 0);
+			 WM_PATHNAME | (icase ? WM_CASEFOLD : 0));
 
 	if (!ret && !already_tried_absolute) {
 		/*
@@ -264,6 +270,26 @@ done:
 	return ret;
 }
 
+static int include_by_branch(const char *cond, size_t cond_len)
+{
+	int flags;
+	int ret;
+	struct strbuf pattern = STRBUF_INIT;
+	const char *refname = !the_repository || !the_repository->gitdir ?
+		NULL : resolve_ref_unsafe("HEAD", 0, NULL, &flags);
+	const char *shortname;
+
+	if (!refname || !(flags & REF_ISSYMREF)	||
+			!skip_prefix(refname, "refs/heads/", &shortname))
+		return 0;
+
+	strbuf_add(&pattern, cond, cond_len);
+	add_trailing_starstar_for_dir(&pattern);
+	ret = !wildmatch(pattern.buf, shortname, WM_PATHNAME);
+	strbuf_release(&pattern);
+	return ret;
+}
+
 static int include_condition_is_true(const struct config_options *opts,
 				     const char *cond, size_t cond_len)
 {
@@ -272,6 +298,8 @@ static int include_condition_is_true(const struct config_options *opts,
 		return include_by_gitdir(opts, cond, cond_len, 0);
 	else if (skip_prefix_mem(cond, cond_len, "gitdir/i:", &cond, &cond_len))
 		return include_by_gitdir(opts, cond, cond_len, 1);
+	else if (skip_prefix_mem(cond, cond_len, "onbranch:", &cond, &cond_len))
+		return include_by_branch(cond, cond_len);
 
 	/* unknown conditionals are always false */
 	return 0;
@@ -834,22 +862,16 @@ static int git_parse_source(config_fn_t fn, void *data,
 	return error_return;
 }
 
-static int parse_unit_factor(const char *end, uintmax_t *val)
+static uintmax_t get_unit_factor(const char *end)
 {
 	if (!*end)
 		return 1;
-	else if (!strcasecmp(end, "k")) {
-		*val *= 1024;
-		return 1;
-	}
-	else if (!strcasecmp(end, "m")) {
-		*val *= 1024 * 1024;
-		return 1;
-	}
-	else if (!strcasecmp(end, "g")) {
-		*val *= 1024 * 1024 * 1024;
-		return 1;
-	}
+	else if (!strcasecmp(end, "k"))
+		return 1024;
+	else if (!strcasecmp(end, "m"))
+		return 1024 * 1024;
+	else if (!strcasecmp(end, "g"))
+		return 1024 * 1024 * 1024;
 	return 0;
 }
 
@@ -859,19 +881,20 @@ static int git_parse_signed(const char *value, intmax_t *ret, intmax_t max)
 		char *end;
 		intmax_t val;
 		uintmax_t uval;
-		uintmax_t factor = 1;
+		uintmax_t factor;
 
 		errno = 0;
 		val = strtoimax(value, &end, 0);
 		if (errno == ERANGE)
 			return 0;
-		if (!parse_unit_factor(end, &factor)) {
+		factor = get_unit_factor(end);
+		if (!factor) {
 			errno = EINVAL;
 			return 0;
 		}
-		uval = labs(val);
-		uval *= factor;
-		if (uval > max || labs(val) > uval) {
+		uval = val < 0 ? -val : val;
+		if (unsigned_mult_overflows(factor, uval) ||
+		    factor * uval > max) {
 			errno = ERANGE;
 			return 0;
 		}
@@ -888,21 +911,23 @@ static int git_parse_unsigned(const char *value, uintmax_t *ret, uintmax_t max)
 	if (value && *value) {
 		char *end;
 		uintmax_t val;
-		uintmax_t oldval;
+		uintmax_t factor;
 
 		errno = 0;
 		val = strtoumax(value, &end, 0);
 		if (errno == ERANGE)
 			return 0;
-		oldval = val;
-		if (!parse_unit_factor(end, &val)) {
+		factor = get_unit_factor(end);
+		if (!factor) {
 			errno = EINVAL;
 			return 0;
 		}
-		if (val > max || oldval > val) {
+		if (unsigned_mult_overflows(factor, val) ||
+		    factor * val > max) {
 			errno = ERANGE;
 			return 0;
 		}
+		val *= factor;
 		*ret = val;
 		return 1;
 	}
@@ -949,34 +974,44 @@ int git_parse_ssize_t(const char *value, ssize_t *ret)
 NORETURN
 static void die_bad_number(const char *name, const char *value)
 {
-	const char * error_type = (errno == ERANGE)? _("out of range"):_("invalid unit");
+	const char *error_type = (errno == ERANGE) ?
+		N_("out of range") : N_("invalid unit");
+	const char *bad_numeric = N_("bad numeric config value '%s' for '%s': %s");
 
 	if (!value)
 		value = "";
 
+	if (!strcmp(name, "GIT_TEST_GETTEXT_POISON"))
+		/*
+		 * We explicitly *don't* use _() here since it would
+		 * cause an infinite loop with _() needing to call
+		 * use_gettext_poison(). This is why marked up
+		 * translations with N_() above.
+		 */
+		die(bad_numeric, value, name, error_type);
+
 	if (!(cf && cf->name))
-		die(_("bad numeric config value '%s' for '%s': %s"),
-		    value, name, error_type);
+		die(_(bad_numeric), value, name, _(error_type));
 
 	switch (cf->origin_type) {
 	case CONFIG_ORIGIN_BLOB:
 		die(_("bad numeric config value '%s' for '%s' in blob %s: %s"),
-		    value, name, cf->name, error_type);
+		    value, name, cf->name, _(error_type));
 	case CONFIG_ORIGIN_FILE:
 		die(_("bad numeric config value '%s' for '%s' in file %s: %s"),
-		    value, name, cf->name, error_type);
+		    value, name, cf->name, _(error_type));
 	case CONFIG_ORIGIN_STDIN:
 		die(_("bad numeric config value '%s' for '%s' in standard input: %s"),
-		    value, name, error_type);
+		    value, name, _(error_type));
 	case CONFIG_ORIGIN_SUBMODULE_BLOB:
 		die(_("bad numeric config value '%s' for '%s' in submodule-blob %s: %s"),
-		    value, name, cf->name, error_type);
+		    value, name, cf->name, _(error_type));
 	case CONFIG_ORIGIN_CMDLINE:
 		die(_("bad numeric config value '%s' for '%s' in command line %s: %s"),
-		    value, name, cf->name, error_type);
+		    value, name, cf->name, _(error_type));
 	default:
 		die(_("bad numeric config value '%s' for '%s' in %s: %s"),
-		    value, name, cf->name, error_type);
+		    value, name, cf->name, _(error_type));
 	}
 }
 
@@ -1445,7 +1480,9 @@ int git_default_config(const char *var, const char *value, void *cb)
 	if (starts_with(var, "core."))
 		return git_default_core_config(var, value, cb);
 
-	if (starts_with(var, "user."))
+	if (starts_with(var, "user.") ||
+	    starts_with(var, "author.") ||
+	    starts_with(var, "committer."))
 		return git_ident_config(var, value, cb);
 
 	if (starts_with(var, "i18n."))
@@ -1674,7 +1711,9 @@ static int do_git_config_sequence(const struct config_options *opts,
 		repo_config = NULL;
 
 	current_parsing_scope = CONFIG_SCOPE_SYSTEM;
-	if (git_config_system() && !access_or_die(git_etc_gitconfig(), R_OK, 0))
+	if (git_config_system() && !access_or_die(git_etc_gitconfig(), R_OK,
+						  opts->system_gently ?
+						  ACCESS_EACCES_OK : 0))
 		ret += git_config_from_file(fn, git_etc_gitconfig(),
 					    data);
 
@@ -1686,14 +1725,15 @@ static int do_git_config_sequence(const struct config_options *opts,
 		ret += git_config_from_file(fn, user_config, data);
 
 	current_parsing_scope = CONFIG_SCOPE_REPO;
-	if (repo_config && !access_or_die(repo_config, R_OK, 0))
+	if (!opts->ignore_repo && repo_config &&
+	    !access_or_die(repo_config, R_OK, 0))
 		ret += git_config_from_file(fn, repo_config, data);
 
 	/*
 	 * Note: this should have a new scope, CONFIG_SCOPE_WORKTREE.
 	 * But let's not complicate things before it's actually needed.
 	 */
-	if (repository_format_worktree_config) {
+	if (!opts->ignore_worktree && repository_format_worktree_config) {
 		char *path = git_pathdup("config.worktree");
 		if (!access_or_die(path, R_OK, 0))
 			ret += git_config_from_file(fn, path, data);
@@ -1701,7 +1741,7 @@ static int do_git_config_sequence(const struct config_options *opts,
 	}
 
 	current_parsing_scope = CONFIG_SCOPE_CMDLINE;
-	if (git_config_from_parameters(fn, data) < 0)
+	if (!opts->ignore_cmdline && git_config_from_parameters(fn, data) < 0)
 		die(_("unable to parse command-line config"));
 
 	current_parsing_scope = CONFIG_SCOPE_UNKNOWN;
@@ -1790,6 +1830,23 @@ void read_early_config(config_fn_t cb, void *data)
 
 	strbuf_release(&commondir);
 	strbuf_release(&gitdir);
+}
+
+/*
+ * Read config but only enumerate system and global settings.
+ * Omit any repo-local, worktree-local, or command-line settings.
+ */
+void read_very_early_config(config_fn_t cb, void *data)
+{
+	struct config_options opts = { 0 };
+
+	opts.respect_includes = 1;
+	opts.ignore_repo = 1;
+	opts.ignore_worktree = 1;
+	opts.ignore_cmdline = 1;
+	opts.system_gently = 1;
+
+	config_with_options(cb, data, NULL, &opts);
 }
 
 static struct config_set_element *configset_find_element(struct config_set *cs, const char *key)
@@ -2009,7 +2066,7 @@ int git_configset_get_pathname(struct config_set *cs, const char *key, const cha
 /* Functions use to read configuration from a repository */
 static void repo_read_config(struct repository *repo)
 {
-	struct config_options opts;
+	struct config_options opts = { 0 };
 
 	opts.respect_includes = 1;
 	opts.commondir = repo->commondir;
@@ -2655,6 +2712,8 @@ int git_config_set_gently(const char *key, const char *value)
 void git_config_set(const char *key, const char *value)
 {
 	git_config_set_multivar(key, value, NULL, 0);
+
+	trace2_cmd_set_config(key, value);
 }
 
 /*

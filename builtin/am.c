@@ -453,6 +453,7 @@ static int run_post_rewrite_hook(const struct am_state *state)
 
 	cp.in = xopen(am_path(state, "rewritten"), O_RDONLY);
 	cp.stdout_to_stderr = 1;
+	cp.trace2_hook_name = "post-rewrite";
 
 	ret = run_command(&cp);
 
@@ -485,23 +486,24 @@ static int copy_notes_for_rebase(const struct am_state *state)
 
 	while (!strbuf_getline_lf(&sb, fp)) {
 		struct object_id from_obj, to_obj;
+		const char *p;
 
-		if (sb.len != GIT_SHA1_HEXSZ * 2 + 1) {
+		if (sb.len != the_hash_algo->hexsz * 2 + 1) {
 			ret = error(invalid_line, sb.buf);
 			goto finish;
 		}
 
-		if (get_oid_hex(sb.buf, &from_obj)) {
+		if (parse_oid_hex(sb.buf, &from_obj, &p)) {
 			ret = error(invalid_line, sb.buf);
 			goto finish;
 		}
 
-		if (sb.buf[GIT_SHA1_HEXSZ] != ' ') {
+		if (*p != ' ') {
 			ret = error(invalid_line, sb.buf);
 			goto finish;
 		}
 
-		if (get_oid_hex(sb.buf + GIT_SHA1_HEXSZ + 1, &to_obj)) {
+		if (get_oid_hex(p + 1, &to_obj)) {
 			ret = error(invalid_line, sb.buf);
 			goto finish;
 		}
@@ -1337,9 +1339,10 @@ static void write_index_patch(const struct am_state *state)
 	struct rev_info rev_info;
 	FILE *fp;
 
-	if (!get_oid_tree("HEAD", &head))
-		tree = lookup_tree(the_repository, &head);
-	else
+	if (!get_oid("HEAD", &head)) {
+		struct commit *commit = lookup_commit_or_die(&head, "HEAD");
+		tree = get_commit_tree(commit);
+	} else
 		tree = lookup_tree(the_repository,
 				   the_repository->hash_algo->empty_tree);
 
@@ -1500,11 +1503,11 @@ static int fall_back_threeway(const struct am_state *state, const char *index_pa
 		 * review them with extra care to spot mismerges.
 		 */
 		struct rev_info rev_info;
-		const char *diff_filter_str = "--diff-filter=AM";
 
 		repo_init_revisions(the_repository, &rev_info, NULL);
 		rev_info.diffopt.output_format = DIFF_FORMAT_NAME_STATUS;
-		diff_opt_parse(&rev_info.diffopt, &diff_filter_str, 1, rev_info.prefix);
+		rev_info.diffopt.filter |= diff_filter_bit('A');
+		rev_info.diffopt.filter |= diff_filter_bit('M');
 		add_pending_oid(&rev_info, "HEAD", &our_tree, 0);
 		diff_setup_done(&rev_info.diffopt);
 		run_diff_index(&rev_info, 1);
@@ -1579,6 +1582,7 @@ static void do_commit(const struct am_state *state)
 	}
 
 	author = fmt_ident(state->author_name, state->author_email,
+		WANT_AUTHOR_IDENT,
 			state->ignore_date ? NULL : state->author_date,
 			IDENT_STRICT);
 
@@ -1640,11 +1644,8 @@ static int do_interactive(struct am_state *state)
 {
 	assert(state->msg);
 
-	if (!isatty(0))
-		die(_("cannot be interactive without stdin connected to a terminal."));
-
 	for (;;) {
-		const char *reply;
+		char reply[64];
 
 		puts(_("Commit Body is:"));
 		puts("--------------------------");
@@ -1656,11 +1657,11 @@ static int do_interactive(struct am_state *state)
 		 * in your translation. The program will only accept English
 		 * input at this point.
 		 */
-		reply = git_prompt(_("Apply? [y]es/[n]o/[e]dit/[v]iew patch/[a]ccept all: "), PROMPT_ECHO);
+		printf(_("Apply? [y]es/[n]o/[e]dit/[v]iew patch/[a]ccept all: "));
+		if (!fgets(reply, sizeof(reply), stdin))
+			die("unable to read from stdin; aborting");
 
-		if (!reply) {
-			continue;
-		} else if (*reply == 'y' || *reply == 'Y') {
+		if (*reply == 'y' || *reply == 'Y') {
 			return 0;
 		} else if (*reply == 'a' || *reply == 'A') {
 			state->interactive = 0;
@@ -1800,7 +1801,7 @@ next:
 	 */
 	if (!state->rebasing) {
 		am_destroy(state);
-		close_all_packs(the_repository->objects);
+		close_object_store(the_repository->objects);
 		run_command_v_opt(argv_gc_auto, RUN_GIT_CMD);
 	}
 }
@@ -1955,7 +1956,7 @@ static int clean_index(const struct object_id *head, const struct object_id *rem
 	if (merge_tree(remote_tree))
 		return -1;
 
-	remove_branch_state(the_repository);
+	remove_branch_state(the_repository, 0);
 
 	return 0;
 }
@@ -2119,6 +2120,10 @@ static int parse_opt_patchformat(const struct option *opt, const char *arg, int 
 		*opt_value = PATCH_FORMAT_HG;
 	else if (!strcmp(arg, "mboxrd"))
 		*opt_value = PATCH_FORMAT_MBOXRD;
+	/*
+	 * Please update $__git_patchformat in git-completion.bash
+	 * when you add new options
+	 */
 	else
 		return error(_("Invalid value for --patch-format: %s"), arg);
 	return 0;
@@ -2326,6 +2331,9 @@ int cmd_am(int argc, const char **argv, const char *prefix)
 			else
 				argv_array_push(&paths, mkpath("%s/%s", prefix, argv[i]));
 		}
+
+		if (state.interactive && !paths.argc)
+			die(_("interactive mode requires patches on the command line"));
 
 		am_setup(&state, patch_format, paths.argv, keep_cr);
 

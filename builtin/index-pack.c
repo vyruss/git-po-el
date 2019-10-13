@@ -14,6 +14,7 @@
 #include "thread-utils.h"
 #include "packfile.h"
 #include "object-store.h"
+#include "fetch-object.h"
 
 static const char index_pack_usage[] =
 "git index-pack [-v] [-o <index-file>] [--keep | --keep=<msg>] [--verify] [--strict] (<pack-file> | --stdin [--fix-thin] [<pack-file>])";
@@ -219,8 +220,16 @@ static unsigned check_objects(void)
 	unsigned i, max, foreign_nr = 0;
 
 	max = get_max_object_index();
-	for (i = 0; i < max; i++)
+
+	if (verbose)
+		progress = start_delayed_progress(_("Checking objects"), max);
+
+	for (i = 0; i < max; i++) {
 		foreign_nr += check_object(get_indexed_object(i));
+		display_progress(progress, i + 1);
+	}
+
+	stop_progress(&progress);
 	return foreign_nr;
 }
 
@@ -1343,6 +1352,25 @@ static void fix_unresolved_deltas(struct hashfile *f)
 		sorted_by_pos[i] = &ref_deltas[i];
 	QSORT(sorted_by_pos, nr_ref_deltas, delta_pos_compare);
 
+	if (repository_format_partial_clone) {
+		/*
+		 * Prefetch the delta bases.
+		 */
+		struct oid_array to_fetch = OID_ARRAY_INIT;
+		for (i = 0; i < nr_ref_deltas; i++) {
+			struct ref_delta_entry *d = sorted_by_pos[i];
+			if (!oid_object_info_extended(the_repository, &d->oid,
+						      NULL,
+						      OBJECT_INFO_FOR_PREFETCH))
+				continue;
+			oid_array_append(&to_fetch, &d->oid);
+		}
+		if (to_fetch.nr)
+			fetch_objects(repository_format_partial_clone,
+				      to_fetch.oid, to_fetch.nr);
+		oid_array_clear(&to_fetch);
+	}
+
 	for (i = 0; i < nr_ref_deltas; i++) {
 		struct ref_delta_entry *d = sorted_by_pos[i];
 		enum object_type type;
@@ -1642,8 +1670,10 @@ int cmd_index_pack(int argc, const char **argv, const char *prefix)
 	int report_end_of_input = 0;
 
 	/*
-	 * index-pack never needs to fetch missing objects, since it only
-	 * accesses the repo to do hash collision checks
+	 * index-pack never needs to fetch missing objects except when
+	 * REF_DELTA bases are missing (which are explicitly handled). It only
+	 * accesses the repo to do hash collision checks and to check which
+	 * REF_DELTA bases need to be fetched.
 	 */
 	fetch_if_missing = 0;
 

@@ -436,7 +436,9 @@ static struct commit *handle_commit(struct rev_info *revs,
 			die("unable to parse commit %s", name);
 		if (flags & UNINTERESTING) {
 			mark_parents_uninteresting(commit);
-			revs->limited = 1;
+
+			if (!revs->topo_order || !generation_numbers_enabled(the_repository))
+				revs->limited = 1;
 		}
 		if (revs->sources) {
 			char **slot = revision_sources_at(revs->sources, commit);
@@ -911,26 +913,11 @@ static void try_to_simplify_commit(struct rev_info *revs, struct commit *commit)
 		commit->object.flags |= TREESAME;
 }
 
-static void commit_list_insert_by_date_cached(struct commit *p, struct commit_list **head,
-		    struct commit_list *cached_base, struct commit_list **cache)
-{
-	struct commit_list *new_entry;
-
-	if (cached_base && p->date < cached_base->item->date)
-		new_entry = commit_list_insert_by_date(p, &cached_base->next);
-	else
-		new_entry = commit_list_insert_by_date(p, head);
-
-	if (cache && (!*cache || p->date < (*cache)->item->date))
-		*cache = new_entry;
-}
-
 static int process_parents(struct rev_info *revs, struct commit *commit,
-			   struct commit_list **list, struct commit_list **cache_ptr)
+			   struct commit_list **list, struct prio_queue *queue)
 {
 	struct commit_list *parent = commit->parents;
 	unsigned left_flag;
-	struct commit_list *cached_base = cache_ptr ? *cache_ptr : NULL;
 
 	if (commit->object.flags & ADDED)
 		return 0;
@@ -966,7 +953,9 @@ static int process_parents(struct rev_info *revs, struct commit *commit,
 				continue;
 			p->object.flags |= SEEN;
 			if (list)
-				commit_list_insert_by_date_cached(p, list, cached_base, cache_ptr);
+				commit_list_insert_by_date(p, list);
+			if (queue)
+				prio_queue_put(queue, p);
 		}
 		return 0;
 	}
@@ -1006,7 +995,9 @@ static int process_parents(struct rev_info *revs, struct commit *commit,
 		if (!(p->object.flags & SEEN)) {
 			p->object.flags |= SEEN;
 			if (list)
-				commit_list_insert_by_date_cached(p, list, cached_base, cache_ptr);
+				commit_list_insert_by_date(p, list);
+			if (queue)
+				prio_queue_put(queue, p);
 		}
 		if (revs->first_parent_only)
 			break;
@@ -1563,6 +1554,32 @@ void add_index_objects_to_pending(struct rev_info *revs, unsigned int flags)
 	free_worktrees(worktrees);
 }
 
+struct add_alternate_refs_data {
+	struct rev_info *revs;
+	unsigned int flags;
+};
+
+static void add_one_alternate_ref(const struct object_id *oid,
+				  void *vdata)
+{
+	const char *name = ".alternate";
+	struct add_alternate_refs_data *data = vdata;
+	struct object *obj;
+
+	obj = get_reference(data->revs, name, oid, data->flags);
+	add_rev_cmdline(data->revs, obj, name, REV_CMD_REV, data->flags);
+	add_pending_object(data->revs, obj, name);
+}
+
+static void add_alternate_refs_to_pending(struct rev_info *revs,
+					  unsigned int flags)
+{
+	struct add_alternate_refs_data data;
+	data.revs = revs;
+	data.flags = flags;
+	for_each_alternate_ref(add_one_alternate_ref, &data);
+}
+
 static int add_parents_only(struct rev_info *revs, const char *arg_, int flags,
 			    int exclude_parent)
 {
@@ -1894,7 +1911,7 @@ int handle_revision_arg(const char *arg_, struct rev_info *revs, int flags, unsi
 	return 0;
 }
 
-static void read_pathspec_from_stdin(struct rev_info *revs, struct strbuf *sb,
+static void read_pathspec_from_stdin(struct strbuf *sb,
 				     struct argv_array *prune)
 {
 	while (strbuf_getline(sb, stdin) != EOF)
@@ -1928,7 +1945,7 @@ static void read_revisions_from_stdin(struct rev_info *revs,
 			die("bad revision '%s'", sb.buf);
 	}
 	if (seen_dashdash)
-		read_pathspec_from_stdin(revs, &sb, prune);
+		read_pathspec_from_stdin(&sb, prune);
 
 	strbuf_release(&sb);
 	warn_on_object_refname_ambiguity = save_warning;
@@ -1965,6 +1982,7 @@ static int handle_revision_opt(struct rev_info *revs, int argc, const char **arg
 	    !strcmp(arg, "--no-walk") || !strcmp(arg, "--do-walk") ||
 	    !strcmp(arg, "--bisect") || starts_with(arg, "--glob=") ||
 	    !strcmp(arg, "--indexed-objects") ||
+	    !strcmp(arg, "--alternate-refs") ||
 	    starts_with(arg, "--exclude=") ||
 	    starts_with(arg, "--branches=") || starts_with(arg, "--tags=") ||
 	    starts_with(arg, "--remotes=") || starts_with(arg, "--no-walk="))
@@ -2151,6 +2169,9 @@ static int handle_revision_opt(struct rev_info *revs, int argc, const char **arg
 		revs->diff = 1;
 		revs->dense_combined_merges = 0;
 		revs->combine_merges = 1;
+	} else if (!strcmp(arg, "--combined-all-paths")) {
+		revs->diff = 1;
+		revs->combined_all_paths = 1;
 	} else if (!strcmp(arg, "--cc")) {
 		revs->diff = 1;
 		revs->dense_combined_merges = 1;
@@ -2448,6 +2469,8 @@ static int handle_revision_pseudo_opt(const char *submodule,
 		add_reflogs_to_pending(revs, *flags);
 	} else if (!strcmp(arg, "--indexed-objects")) {
 		add_index_objects_to_pending(revs, *flags);
+	} else if (!strcmp(arg, "--alternate-refs")) {
+		add_alternate_refs_to_pending(revs, *flags);
 	} else if (!strcmp(arg, "--not")) {
 		*flags ^= UNINTERESTING | BOTTOM;
 	} else if (!strcmp(arg, "--no-walk")) {
@@ -2647,6 +2670,9 @@ int setup_revisions(int argc, const char **argv, struct rev_info *revs, struct s
 	}
 	if (revs->combine_merges)
 		revs->ignore_merges = 0;
+	if (revs->combined_all_paths && !revs->combine_merges)
+		die("--combined-all-paths makes no sense without -c or --cc");
+
 	revs->diffopt.abbrev = revs->abbrev;
 
 	if (revs->line_level_traverse) {
@@ -2682,6 +2708,10 @@ int setup_revisions(int argc, const char **argv, struct rev_info *revs, struct s
 
 	if (revs->first_parent_only && revs->bisect)
 		die(_("--first-parent is incompatible with --bisect"));
+
+	if (revs->line_level_traverse &&
+	    (revs->diffopt.output_format & ~(DIFF_FORMAT_PATCH | DIFF_FORMAT_NO_OUTPUT)))
+		die(_("-L does not yet support diff formats besides -p and -s"));
 
 	if (revs->expand_tabs_in_log < 0)
 		revs->expand_tabs_in_log = revs->expand_tabs_in_log_default;
@@ -2742,7 +2772,7 @@ static struct merge_simplify_state *locate_simplify_state(struct rev_info *revs,
 	return st;
 }
 
-static int mark_redundant_parents(struct rev_info *revs, struct commit *commit)
+static int mark_redundant_parents(struct commit *commit)
 {
 	struct commit_list *h = reduce_heads(commit->parents);
 	int i = 0, marked = 0;
@@ -2778,7 +2808,7 @@ static int mark_redundant_parents(struct rev_info *revs, struct commit *commit)
 	return marked;
 }
 
-static int mark_treesame_root_parents(struct rev_info *revs, struct commit *commit)
+static int mark_treesame_root_parents(struct commit *commit)
 {
 	struct commit_list *p;
 	int marked = 0;
@@ -2970,8 +3000,8 @@ static struct commit_list **simplify_one(struct rev_info *revs, struct commit *c
 	 * Detect and simplify both cases.
 	 */
 	if (1 < cnt) {
-		int marked = mark_redundant_parents(revs, commit);
-		marked += mark_treesame_root_parents(revs, commit);
+		int marked = mark_redundant_parents(commit);
+		marked += mark_treesame_root_parents(commit);
 		if (marked)
 			marked -= leave_one_treesame_to_parent(revs, commit);
 		if (marked)
@@ -3264,6 +3294,9 @@ static void expand_topo_walk(struct rev_info *revs, struct commit *commit)
 		struct commit *parent = p->item;
 		int *pi;
 
+		if (parent->object.flags & UNINTERESTING)
+			continue;
+
 		if (parse_commit_gently(parent, 1) < 0)
 			continue;
 
@@ -3335,14 +3368,14 @@ int prepare_revision_walk(struct rev_info *revs)
 	return 0;
 }
 
-static enum rewrite_result rewrite_one(struct rev_info *revs, struct commit **pp)
+static enum rewrite_result rewrite_one_1(struct rev_info *revs,
+					 struct commit **pp,
+					 struct prio_queue *queue)
 {
-	struct commit_list *cache = NULL;
-
 	for (;;) {
 		struct commit *p = *pp;
 		if (!revs->limited)
-			if (process_parents(revs, p, &revs->commits, &cache) < 0)
+			if (process_parents(revs, p, NULL, queue) < 0)
 				return rewrite_one_error;
 		if (p->object.flags & UNINTERESTING)
 			return rewrite_one_ok;
@@ -3354,6 +3387,31 @@ static enum rewrite_result rewrite_one(struct rev_info *revs, struct commit **pp
 			return rewrite_one_ok;
 		*pp = p;
 	}
+}
+
+static void merge_queue_into_list(struct prio_queue *q, struct commit_list **list)
+{
+	while (q->nr) {
+		struct commit *item = prio_queue_peek(q);
+		struct commit_list *p = *list;
+
+		if (p && p->item->date >= item->date)
+			list = &p->next;
+		else {
+			p = commit_list_insert(item, list);
+			list = &p->next; /* skip newly added item */
+			prio_queue_get(q); /* pop item */
+		}
+	}
+}
+
+static enum rewrite_result rewrite_one(struct rev_info *revs, struct commit **pp)
+{
+	struct prio_queue queue = { compare_commits_by_commit_date };
+	enum rewrite_result ret = rewrite_one_1(revs, pp, &queue);
+	merge_queue_into_list(&queue, &revs->commits);
+	clear_prio_queue(&queue);
+	return ret;
 }
 
 int rewrite_parents(struct rev_info *revs, struct commit *commit,

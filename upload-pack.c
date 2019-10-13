@@ -528,13 +528,13 @@ static int get_reachable_list(struct object_array *src,
 		return -1;
 
 	while ((i = read_in_full(cmd.out, namebuf, hexsz + 1)) == hexsz + 1) {
-		struct object_id sha1;
+		struct object_id oid;
 		const char *p;
 
-		if (parse_oid_hex(namebuf, &sha1, &p) || *p != '\n')
+		if (parse_oid_hex(namebuf, &oid, &p) || *p != '\n')
 			break;
 
-		o = lookup_object(the_repository, sha1.hash);
+		o = lookup_object(the_repository, &oid);
 		if (o && o->type == OBJ_COMMIT) {
 			o->flags &= ~TMP_MARK;
 		}
@@ -592,7 +592,8 @@ error:
 	return 1;
 }
 
-static void check_non_tip(struct object_array *want_obj)
+static void check_non_tip(struct object_array *want_obj,
+			  struct packet_writer *writer)
 {
 	int i;
 
@@ -611,9 +612,13 @@ error:
 	/* Pick one of them (we know there at least is one) */
 	for (i = 0; i < want_obj->nr; i++) {
 		struct object *o = want_obj->objects[i].item;
-		if (!is_our_ref(o))
+		if (!is_our_ref(o)) {
+			packet_writer_error(writer,
+					    "upload-pack: not our ref %s",
+					    oid_to_hex(&o->oid));
 			die("git upload-pack: not our ref %s",
 			    oid_to_hex(&o->oid));
+		}
 	}
 }
 
@@ -717,7 +722,7 @@ static void deepen_by_rev_list(struct packet_writer *writer, int ac,
 {
 	struct commit_list *result;
 
-	close_commit_graph(the_repository);
+	close_commit_graph(the_repository->objects);
 	result = get_shallow_commits_by_rev_list(ac, av, SHALLOW, NOT_SHALLOW);
 	send_shallow(writer, result);
 	free_commit_list(result);
@@ -834,7 +839,7 @@ static int process_deepen_not(const char *line, struct string_list *deepen_not, 
 	if (skip_prefix(line, "deepen-not ", &arg)) {
 		char *ref = NULL;
 		struct object_id oid;
-		if (expand_ref(arg, strlen(arg), &oid, &ref) != 1)
+		if (expand_ref(the_repository, arg, strlen(arg), &oid, &ref) != 1)
 			die("git upload-pack: ambiguous deepen-not: %s", line);
 		string_list_append(deepen_not, ref);
 		free(ref);
@@ -936,7 +941,7 @@ static void receive_needs(struct packet_reader *reader, struct object_array *wan
 	 * by another process that handled the initial request.
 	 */
 	if (has_non_tip)
-		check_non_tip(want_obj);
+		check_non_tip(want_obj, &writer);
 
 	if (!use_sideband && daemon_mode)
 		no_progress = 1;
@@ -955,7 +960,7 @@ static void receive_needs(struct packet_reader *reader, struct object_array *wan
 static int mark_our_ref(const char *refname, const char *refname_full,
 			const struct object_id *oid)
 {
-	struct object *o = lookup_unknown_object(oid->hash);
+	struct object *o = lookup_unknown_object(oid);
 
 	if (ref_is_hidden(refname, refname_full)) {
 		o->flags |= HIDDEN_REF;
@@ -1032,8 +1037,8 @@ static int find_symref(const char *refname, const struct object_id *oid,
 	symref_target = resolve_ref_unsafe(refname, 0, NULL, &flag);
 	if (!symref_target || (flag & REF_ISSYMREF) == 0)
 		die("'%s' is a symref but it is not?", refname);
-	item = string_list_append(cb_data, refname);
-	item->util = xstrdup(symref_target);
+	item = string_list_append(cb_data, strip_namespace(refname));
+	item->util = xstrdup(strip_namespace(symref_target));
 	return 0;
 }
 
@@ -1064,6 +1069,8 @@ static int upload_pack_config(const char *var, const char *value, void *unused)
 		allow_ref_in_want = git_config_bool(var, value);
 	} else if (!strcmp("uploadpack.allowsidebandall", var)) {
 		allow_sideband_all = git_config_bool(var, value);
+	} else if (!strcmp("core.precomposeunicode", var)) {
+		precomposed_unicode = git_config_bool(var, value);
 	}
 
 	if (current_config_scope() != CONFIG_SCOPE_REPO) {

@@ -191,8 +191,10 @@ static void send_request(struct fetch_pack_args *args,
 	if (args->stateless_rpc) {
 		send_sideband(fd, -1, buf->buf, buf->len, LARGE_PACKET_MAX);
 		packet_flush(fd);
-	} else
-		write_or_die(fd, buf->buf, buf->len);
+	} else {
+		if (write_in_full(fd, buf->buf, buf->len) < 0)
+			die_errno(_("unable to write to remote"));
+	}
 }
 
 static void insert_one_alternate_object(struct fetch_negotiator *negotiator,
@@ -284,7 +286,7 @@ static int find_common(struct fetch_negotiator *negotiator,
 		 * we cannot trust the object flags).
 		 */
 		if (!args->no_dependents &&
-		    ((o = lookup_object(the_repository, remote->hash)) != NULL) &&
+		    ((o = lookup_object(the_repository, remote)) != NULL) &&
 				(o->flags & COMPLETE)) {
 			continue;
 		}
@@ -362,7 +364,7 @@ static int find_common(struct fetch_negotiator *negotiator,
 			if (skip_prefix(reader.line, "unshallow ", &arg)) {
 				if (get_oid_hex(arg, &oid))
 					die(_("invalid unshallow line: %s"), reader.line);
-				if (!lookup_object(the_repository, oid.hash))
+				if (!lookup_object(the_repository, &oid))
 					die(_("object not found: %s"), reader.line);
 				/* make sure that it is parsed as shallow */
 				if (!parse_object(the_repository, &oid))
@@ -571,9 +573,14 @@ static void filter_refs(struct fetch_pack_args *args,
 		next = ref->next;
 
 		if (starts_with(ref->name, "refs/") &&
-		    check_refname_format(ref->name, 0))
-			; /* trash */
-		else {
+		    check_refname_format(ref->name, 0)) {
+			/*
+			 * trash or a peeled value; do not even add it to
+			 * unmatched list
+			 */
+			free_one_ref(ref);
+			continue;
+		} else {
 			while (i < nr_sought) {
 				int cmp = strcmp(ref->name, sought[i]->name);
 				if (cmp < 0)
@@ -628,10 +635,7 @@ static void filter_refs(struct fetch_pack_args *args,
 	}
 
 	oidset_clear(&tip_oids);
-	for (ref = unmatched; ref; ref = next) {
-		next = ref->next;
-		free(ref);
-	}
+	free_refs(unmatched);
 
 	*refs = newlist;
 }
@@ -703,7 +707,7 @@ static void mark_complete_and_common_ref(struct fetch_negotiator *negotiator,
 	for (ref = *refs; ref; ref = ref->next) {
 		struct object *o = deref_tag(the_repository,
 					     lookup_object(the_repository,
-					     ref->old_oid.hash),
+					     &ref->old_oid),
 					     NULL, 0);
 
 		if (!o || o->type != OBJ_COMMIT || !(o->flags & COMPLETE))
@@ -730,7 +734,7 @@ static int everything_local(struct fetch_pack_args *args,
 		const struct object_id *remote = &ref->old_oid;
 		struct object *o;
 
-		o = lookup_object(the_repository, remote->hash);
+		o = lookup_object(the_repository, remote);
 		if (!o || !(o->flags & COMPLETE)) {
 			retval = 0;
 			print_verbose(args, "want %s (%s)", oid_to_hex(remote),
@@ -898,72 +902,85 @@ static struct ref *do_fetch_pack(struct fetch_pack_args *args,
 	sort_ref_list(&ref, ref_compare_name);
 	QSORT(sought, nr_sought, cmp_ref_by_name);
 
-	if ((args->depth > 0 || is_repository_shallow(the_repository)) && !server_supports("shallow"))
-		die(_("Server does not support shallow clients"));
-	if (args->depth > 0 || args->deepen_since || args->deepen_not)
-		args->deepen = 1;
-	if (server_supports("multi_ack_detailed")) {
-		print_verbose(args, _("Server supports multi_ack_detailed"));
-		multi_ack = 2;
-		if (server_supports("no-done")) {
-			print_verbose(args, _("Server supports no-done"));
-			if (args->stateless_rpc)
-				no_done = 1;
-		}
-	}
-	else if (server_supports("multi_ack")) {
-		print_verbose(args, _("Server supports multi_ack"));
-		multi_ack = 1;
-	}
-	if (server_supports("side-band-64k")) {
-		print_verbose(args, _("Server supports side-band-64k"));
-		use_sideband = 2;
-	}
-	else if (server_supports("side-band")) {
-		print_verbose(args, _("Server supports side-band"));
-		use_sideband = 1;
-	}
-	if (server_supports("allow-tip-sha1-in-want")) {
-		print_verbose(args, _("Server supports allow-tip-sha1-in-want"));
-		allow_unadvertised_object_request |= ALLOW_TIP_SHA1;
-	}
-	if (server_supports("allow-reachable-sha1-in-want")) {
-		print_verbose(args, _("Server supports allow-reachable-sha1-in-want"));
-		allow_unadvertised_object_request |= ALLOW_REACHABLE_SHA1;
-	}
-	if (!server_supports("thin-pack"))
-		args->use_thin_pack = 0;
-	if (!server_supports("no-progress"))
-		args->no_progress = 0;
-	if (!server_supports("include-tag"))
-		args->include_tag = 0;
-	if (server_supports("ofs-delta"))
-		print_verbose(args, _("Server supports ofs-delta"));
-	else
-		prefer_ofs_delta = 0;
-
-	if (server_supports("filter")) {
-		server_supports_filtering = 1;
-		print_verbose(args, _("Server supports filter"));
-	} else if (args->filter_options.choice) {
-		warning("filtering not recognized by server, ignoring");
-	}
-
 	if ((agent_feature = server_feature_value("agent", &agent_len))) {
 		agent_supported = 1;
 		if (agent_len)
 			print_verbose(args, _("Server version is %.*s"),
 				      agent_len, agent_feature);
 	}
-	if (server_supports("deepen-since"))
+
+	if (server_supports("shallow"))
+		print_verbose(args, _("Server supports %s"), "shallow");
+	else if (args->depth > 0 || is_repository_shallow(the_repository))
+		die(_("Server does not support shallow clients"));
+	if (args->depth > 0 || args->deepen_since || args->deepen_not)
+		args->deepen = 1;
+	if (server_supports("multi_ack_detailed")) {
+		print_verbose(args, _("Server supports %s"), "multi_ack_detailed");
+		multi_ack = 2;
+		if (server_supports("no-done")) {
+			print_verbose(args, _("Server supports %s"), "no-done");
+			if (args->stateless_rpc)
+				no_done = 1;
+		}
+	}
+	else if (server_supports("multi_ack")) {
+		print_verbose(args, _("Server supports %s"), "multi_ack");
+		multi_ack = 1;
+	}
+	if (server_supports("side-band-64k")) {
+		print_verbose(args, _("Server supports %s"), "side-band-64k");
+		use_sideband = 2;
+	}
+	else if (server_supports("side-band")) {
+		print_verbose(args, _("Server supports %s"), "side-band");
+		use_sideband = 1;
+	}
+	if (server_supports("allow-tip-sha1-in-want")) {
+		print_verbose(args, _("Server supports %s"), "allow-tip-sha1-in-want");
+		allow_unadvertised_object_request |= ALLOW_TIP_SHA1;
+	}
+	if (server_supports("allow-reachable-sha1-in-want")) {
+		print_verbose(args, _("Server supports %s"), "allow-reachable-sha1-in-want");
+		allow_unadvertised_object_request |= ALLOW_REACHABLE_SHA1;
+	}
+	if (server_supports("thin-pack"))
+		print_verbose(args, _("Server supports %s"), "thin-pack");
+	else
+		args->use_thin_pack = 0;
+	if (server_supports("no-progress"))
+		print_verbose(args, _("Server supports %s"), "no-progress");
+	else
+		args->no_progress = 0;
+	if (server_supports("include-tag"))
+		print_verbose(args, _("Server supports %s"), "include-tag");
+	else
+		args->include_tag = 0;
+	if (server_supports("ofs-delta"))
+		print_verbose(args, _("Server supports %s"), "ofs-delta");
+	else
+		prefer_ofs_delta = 0;
+
+	if (server_supports("filter")) {
+		server_supports_filtering = 1;
+		print_verbose(args, _("Server supports %s"), "filter");
+	} else if (args->filter_options.choice) {
+		warning("filtering not recognized by server, ignoring");
+	}
+
+	if (server_supports("deepen-since")) {
+		print_verbose(args, _("Server supports %s"), "deepen-since");
 		deepen_since_ok = 1;
-	else if (args->deepen_since)
+	} else if (args->deepen_since)
 		die(_("Server does not support --shallow-since"));
-	if (server_supports("deepen-not"))
+	if (server_supports("deepen-not")) {
+		print_verbose(args, _("Server supports %s"), "deepen-not");
 		deepen_not_ok = 1;
-	else if (args->deepen_not)
+	} else if (args->deepen_not)
 		die(_("Server does not support --shallow-exclude"));
-	if (!server_supports("deepen-relative") && args->deepen_relative)
+	if (server_supports("deepen-relative"))
+		print_verbose(args, _("Server supports %s"), "deepen-relative");
+	else if (args->deepen_relative)
 		die(_("Server does not support --deepen"));
 
 	if (!args->no_dependents) {
@@ -1044,7 +1061,7 @@ static void add_wants(int no_dependents, const struct ref *wants, struct strbuf 
 		 * we cannot trust the object flags).
 		 */
 		if (!no_dependents &&
-		    ((o = lookup_object(the_repository, remote->hash)) != NULL) &&
+		    ((o = lookup_object(the_repository, remote)) != NULL) &&
 		    (o->flags & COMPLETE)) {
 			continue;
 		}
@@ -1111,7 +1128,7 @@ static int send_fetch_request(struct fetch_negotiator *negotiator, int fd_out,
 	    server_supports_v2("server-option", 1)) {
 		int i;
 		for (i = 0; i < args->server_options->nr; i++)
-			packet_write_fmt(fd_out, "server-option=%s",
+			packet_buf_write(&req_buf, "server-option=%s",
 					 args->server_options->items[i].string);
 	}
 
@@ -1163,7 +1180,8 @@ static int send_fetch_request(struct fetch_negotiator *negotiator, int fd_out,
 
 	/* Send request */
 	packet_buf_flush(&req_buf);
-	write_or_die(fd_out, req_buf.buf, req_buf.len);
+	if (write_in_full(fd_out, req_buf.buf, req_buf.len) < 0)
+		die_errno(_("unable to write request to remote"));
 
 	strbuf_release(&req_buf);
 	return ret;
@@ -1250,9 +1268,11 @@ static int process_acks(struct fetch_negotiator *negotiator,
 }
 
 static void receive_shallow_info(struct fetch_pack_args *args,
-				 struct packet_reader *reader)
+				 struct packet_reader *reader,
+				 struct oid_array *shallows,
+				 struct shallow_info *si)
 {
-	int line_received = 0;
+	int unshallow_received = 0;
 
 	process_section_header(reader, "shallow-info", 0);
 	while (packet_reader_read(reader) == PACKET_READ_NORMAL) {
@@ -1262,21 +1282,20 @@ static void receive_shallow_info(struct fetch_pack_args *args,
 		if (skip_prefix(reader->line, "shallow ", &arg)) {
 			if (get_oid_hex(arg, &oid))
 				die(_("invalid shallow line: %s"), reader->line);
-			register_shallow(the_repository, &oid);
-			line_received = 1;
+			oid_array_append(shallows, &oid);
 			continue;
 		}
 		if (skip_prefix(reader->line, "unshallow ", &arg)) {
 			if (get_oid_hex(arg, &oid))
 				die(_("invalid unshallow line: %s"), reader->line);
-			if (!lookup_object(the_repository, oid.hash))
+			if (!lookup_object(the_repository, &oid))
 				die(_("object not found: %s"), reader->line);
 			/* make sure that it is parsed as shallow */
 			if (!parse_object(the_repository, &oid))
 				die(_("error in object: %s"), reader->line);
 			if (unregister_shallow(&oid))
 				die(_("no shallow found: %s"), reader->line);
-			line_received = 1;
+			unshallow_received = 1;
 			continue;
 		}
 		die(_("expected shallow/unshallow, got %s"), reader->line);
@@ -1286,13 +1305,39 @@ static void receive_shallow_info(struct fetch_pack_args *args,
 	    reader->status != PACKET_READ_DELIM)
 		die(_("error processing shallow info: %d"), reader->status);
 
-	if (line_received) {
+	if (args->deepen || unshallow_received) {
+		/*
+		 * Treat these as shallow lines caused by our depth settings.
+		 * In v0, these lines cannot cause refs to be rejected; do the
+		 * same.
+		 */
+		int i;
+
+		for (i = 0; i < shallows->nr; i++)
+			register_shallow(the_repository, &shallows->oid[i]);
 		setup_alternate_shallow(&shallow_lock, &alternate_shallow_file,
 					NULL);
 		args->deepen = 1;
+	} else if (shallows->nr) {
+		/*
+		 * Treat these as shallow lines caused by the remote being
+		 * shallow. In v0, remote refs that reach these objects are
+		 * rejected (unless --update-shallow is set); do the same.
+		 */
+		prepare_shallow_info(si, shallows);
+		if (si->nr_ours || si->nr_theirs)
+			alternate_shallow_file =
+				setup_temporary_shallow(si->shallow);
+		else
+			alternate_shallow_file = NULL;
 	} else {
 		alternate_shallow_file = NULL;
 	}
+}
+
+static int cmp_name_ref(const void *name, const void *ref)
+{
+	return strcmp(name, (*(struct ref **)ref)->name);
 }
 
 static void receive_wanted_refs(struct packet_reader *reader,
@@ -1302,20 +1347,16 @@ static void receive_wanted_refs(struct packet_reader *reader,
 	while (packet_reader_read(reader) == PACKET_READ_NORMAL) {
 		struct object_id oid;
 		const char *end;
-		int i;
+		struct ref **found;
 
 		if (parse_oid_hex(reader->line, &oid, &end) || *end++ != ' ')
 			die(_("expected wanted-ref, got '%s'"), reader->line);
 
-		for (i = 0; i < nr_sought; i++) {
-			if (!strcmp(end, sought[i]->name)) {
-				oidcpy(&sought[i]->old_oid, &oid);
-				break;
-			}
-		}
-
-		if (i == nr_sought)
+		found = bsearch(end, sought, nr_sought, sizeof(*sought),
+				cmp_name_ref);
+		if (!found)
 			die(_("unexpected wanted-ref: '%s'"), reader->line);
+		oidcpy(&(*found)->old_oid, &oid);
 	}
 
 	if (reader->status != PACKET_READ_DELIM)
@@ -1334,6 +1375,8 @@ static struct ref *do_fetch_pack_v2(struct fetch_pack_args *args,
 				    int fd[2],
 				    const struct ref *orig_ref,
 				    struct ref **sought, int nr_sought,
+				    struct oid_array *shallows,
+				    struct shallow_info *si,
 				    char **pack_lockfile)
 {
 	struct ref *ref = copy_ref_list(orig_ref);
@@ -1408,7 +1451,7 @@ static struct ref *do_fetch_pack_v2(struct fetch_pack_args *args,
 		case FETCH_GET_PACK:
 			/* Check for shallow-info section */
 			if (process_section_header(&reader, "shallow-info", 1))
-				receive_shallow_info(args, &reader);
+				receive_shallow_info(args, &reader, shallows, si);
 
 			if (process_section_header(&reader, "wanted-refs", 1))
 				receive_wanted_refs(&reader, sought, nr_sought);
@@ -1612,9 +1655,8 @@ static int iterate_ref_map(void *cb_data, struct object_id *oid)
 }
 
 struct ref *fetch_pack(struct fetch_pack_args *args,
-		       int fd[], struct child_process *conn,
+		       int fd[],
 		       const struct ref *ref,
-		       const char *dest,
 		       struct ref **sought, int nr_sought,
 		       struct oid_array *shallow,
 		       char **pack_lockfile,
@@ -1622,6 +1664,7 @@ struct ref *fetch_pack(struct fetch_pack_args *args,
 {
 	struct ref *ref_cpy;
 	struct shallow_info si;
+	struct oid_array shallows_scratch = OID_ARRAY_INIT;
 
 	fetch_pack_setup();
 	if (nr_sought)
@@ -1645,13 +1688,18 @@ struct ref *fetch_pack(struct fetch_pack_args *args,
 		packet_flush(fd[1]);
 		die(_("no matching remote head"));
 	}
-	prepare_shallow_info(&si, shallow);
-	if (version == protocol_v2)
+	if (version == protocol_v2) {
+		if (shallow->nr)
+			BUG("Protocol V2 does not provide shallows at this point in the fetch");
+		memset(&si, 0, sizeof(si));
 		ref_cpy = do_fetch_pack_v2(args, fd, ref, sought, nr_sought,
+					   &shallows_scratch, &si,
 					   pack_lockfile);
-	else
+	} else {
+		prepare_shallow_info(&si, shallow);
 		ref_cpy = do_fetch_pack(args, fd, ref, sought, nr_sought,
 					&si, pack_lockfile);
+	}
 	reprepare_packed_git(the_repository);
 
 	if (!args->cloning && args->deepen) {
@@ -1673,6 +1721,7 @@ struct ref *fetch_pack(struct fetch_pack_args *args,
 	update_shallow(args, sought, nr_sought, &si);
 cleanup:
 	clear_shallow_info(&si);
+	oid_array_clear(&shallows_scratch);
 	return ref_cpy;
 }
 

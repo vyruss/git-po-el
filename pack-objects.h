@@ -187,7 +187,7 @@ struct object_entry *packlist_alloc(struct packing_data *pdata,
 				    uint32_t index_pos);
 
 struct object_entry *packlist_find(struct packing_data *pdata,
-				   const unsigned char *sha1,
+				   const struct object_id *oid,
 				   uint32_t *index_pos);
 
 static inline uint32_t pack_name_hash(const char *name)
@@ -247,14 +247,14 @@ static inline struct packed_git *oe_in_pack(const struct packing_data *pack,
 		return pack->in_pack[e - pack->objects];
 }
 
-void oe_map_new_pack(struct packing_data *pack,
-		     struct packed_git *p);
+void oe_map_new_pack(struct packing_data *pack);
+
 static inline void oe_set_in_pack(struct packing_data *pack,
 				  struct object_entry *e,
 				  struct packed_git *p)
 {
 	if (!p->index)
-		oe_map_new_pack(pack, p);
+		oe_map_new_pack(pack);
 	if (pack->in_pack_by_idx)
 		e->in_pack_idx = p->index;
 	else

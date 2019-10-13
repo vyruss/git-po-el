@@ -1437,6 +1437,7 @@ test_expect_success 'double dash "git checkout"' '
 	--guess Z
 	--no-guess Z
 	--no-... Z
+	--overlay Z
 	EOF
 '
 
@@ -1481,6 +1482,12 @@ test_expect_success 'general options plus command' '
 test_expect_success 'git --help completion' '
 	test_completion "git --help ad" "add " &&
 	test_completion "git --help core" "core-tutorial "
+'
+
+test_expect_success 'completion.commands removes multiple commands' '
+	test_config completion.commands "-cherry -mergetool" &&
+	git --list-cmds=list-mainporcelain,list-complete,config >out &&
+	! grep -E "^(cherry|mergetool)$" out
 '
 
 test_expect_success 'setup for integration tests' '
@@ -1699,7 +1706,7 @@ test_expect_success 'sourcing the completion script clears cached commands' '
 '
 
 test_expect_success 'sourcing the completion script clears cached merge strategies' '
-	GIT_TEST_GETTEXT_POISON= &&
+	GIT_TEST_GETTEXT_POISON=false &&
 	__git_compute_merge_strategies &&
 	verbose test -n "$__git_merge_strategies" &&
 	. "$GIT_BUILD_DIR/contrib/completion/git-completion.bash" &&
