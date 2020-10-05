@@ -42,7 +42,8 @@ clean_fake_sendmail () {
 }
 
 test_expect_success $PREREQ 'Extract patches' '
-	patches=$(git format-patch -s --cc="One <one@example.com>" --cc=two@example.com -n HEAD^1)
+	patches=$(git format-patch -s --cc="One <one@example.com>" --cc=two@example.com -n HEAD^1) &&
+	threaded_patches=$(git format-patch -o threaded -s --in-reply-to="format" HEAD^1)
 '
 
 # Test no confirm early to ensure remaining tests will not hang
@@ -1194,8 +1195,8 @@ test_expect_success $PREREQ 'in-reply-to but no threading' '
 		--to=nobody@example.com \
 		--in-reply-to="<in-reply-id@example.com>" \
 		--no-thread \
-		$patches |
-	grep "In-Reply-To: <in-reply-id@example.com>"
+		$patches >out &&
+	grep "In-Reply-To: <in-reply-id@example.com>" out
 '
 
 test_expect_success $PREREQ 'no in-reply-to and no threading' '
@@ -1217,6 +1218,17 @@ test_expect_success $PREREQ 'threading but no chain-reply-to' '
 		--no-chain-reply-to \
 		$patches $patches >stdout &&
 	grep "In-Reply-To: " stdout
+'
+
+test_expect_success $PREREQ 'override in-reply-to if no threading' '
+	git send-email \
+		--dry-run \
+		--from="Example <nobody@example.com>" \
+		--to=nobody@example.com \
+		--no-thread \
+		--in-reply-to="override" \
+		$threaded_patches >stdout &&
+	grep "In-Reply-To: <override>" stdout
 '
 
 test_expect_success $PREREQ 'sendemail.to works' '
@@ -1260,7 +1272,7 @@ test_expect_success $PREREQ 'sendemail.identity: --no-identity clears previous i
 	grep "To: default@example.com" stdout
 '
 
-test_expect_success $PREREQ 'sendemail.identity: bool identity variable existance overrides' '
+test_expect_success $PREREQ 'sendemail.identity: bool identity variable existence overrides' '
 	git -c sendemail.identity=cloud \
 		-c sendemail.xmailer=true \
 		-c sendemail.cloud.xmailer=false \
@@ -2066,7 +2078,7 @@ test_expect_success $PREREQ 'leading and trailing whitespaces are removed' '
 	TO1=$(echo "QTo 1 <to1@example.com>" | q_to_tab) &&
 	TO2=$(echo "QZto2" | qz_to_tab_space) &&
 	CC1=$(echo "cc1" | append_cr) &&
-	BCC1=$(echo "Q bcc1@example.com Q" | q_to_nul) &&
+	BCC1=$(echo " bcc1@example.com Q" | q_to_nul) &&
 	git send-email \
 	--dry-run \
 	--from="	Example <from@example.com>" \

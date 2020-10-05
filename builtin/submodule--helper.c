@@ -19,6 +19,8 @@
 #include "diffcore.h"
 #include "diff.h"
 #include "object-store.h"
+#include "dir.h"
+#include "advice.h"
 
 #define OPT_QUIET (1 << 0)
 #define OPT_CACHED (1 << 1)
@@ -424,7 +426,7 @@ static int module_list(int argc, const char **argv, const char *prefix)
 		const struct cache_entry *ce = list.entries[i];
 
 		if (ce_stage(ce))
-			printf("%06o %s U\t", ce->ce_mode, sha1_to_hex(null_sha1));
+			printf("%06o %s U\t", ce->ce_mode, oid_to_hex(&null_oid));
 		else
 			printf("%06o %s %d\t", ce->ce_mode,
 			       oid_to_hex(&ce->oid), ce_stage(ce));
@@ -442,19 +444,19 @@ static void for_each_listed_submodule(const struct module_list *list,
 		fn(list->entries[i], cb_data);
 }
 
-struct cb_foreach {
+struct foreach_cb {
 	int argc;
 	const char **argv;
 	const char *prefix;
 	int quiet;
 	int recursive;
 };
-#define CB_FOREACH_INIT { 0 }
+#define FOREACH_CB_INIT { 0 }
 
 static void runcommand_in_submodule_cb(const struct cache_entry *list_item,
 				       void *cb_data)
 {
-	struct cb_foreach *info = cb_data;
+	struct foreach_cb *info = cb_data;
 	const char *path = list_item->name;
 	const struct object_id *ce_oid = &list_item->oid;
 
@@ -555,7 +557,7 @@ cleanup:
 
 static int module_foreach(int argc, const char **argv, const char *prefix)
 {
-	struct cb_foreach info = CB_FOREACH_INIT;
+	struct foreach_cb info = FOREACH_CB_INIT;
 	struct pathspec pathspec;
 	struct module_list list = MODULE_LIST_INIT;
 
@@ -780,6 +782,8 @@ static void status_submodule(const char *path, const struct object_id *ce_oid,
 	struct argv_array diff_files_args = ARGV_ARRAY_INIT;
 	struct rev_info rev;
 	int diff_files_result;
+	struct strbuf buf = STRBUF_INIT;
+	const char *git_dir;
 
 	if (!submodule_from_path(the_repository, &null_oid, path))
 		die(_("no submodule mapping found in .gitmodules for path '%s'"),
@@ -792,17 +796,26 @@ static void status_submodule(const char *path, const struct object_id *ce_oid,
 		goto cleanup;
 	}
 
-	if (!is_submodule_active(the_repository, path)) {
+	strbuf_addf(&buf, "%s/.git", path);
+	git_dir = read_gitfile(buf.buf);
+	if (!git_dir)
+		git_dir = buf.buf;
+
+	if (!is_submodule_active(the_repository, path) ||
+	    !is_git_directory(git_dir)) {
 		print_status(flags, '-', path, ce_oid, displaypath);
+		strbuf_release(&buf);
 		goto cleanup;
 	}
+	strbuf_release(&buf);
 
 	argv_array_pushl(&diff_files_args, "diff-files",
 			 "--ignore-submodules=dirty", "--quiet", "--",
 			 path, NULL);
 
 	git_config(git_diff_basic_config, NULL);
-	repo_init_revisions(the_repository, &rev, prefix);
+
+	repo_init_revisions(the_repository, &rev, NULL);
 	rev.abbrev = 0;
 	diff_files_args.argc = setup_revisions(diff_files_args.argc,
 					       diff_files_args.argv,
@@ -1222,7 +1235,7 @@ static int module_deinit(int argc, const char **argv, const char *prefix)
 
 static int clone_submodule(const char *path, const char *gitdir, const char *url,
 			   const char *depth, struct string_list *reference, int dissociate,
-			   int quiet, int progress)
+			   int quiet, int progress, int single_branch)
 {
 	struct child_process cp = CHILD_PROCESS_INIT;
 
@@ -1244,6 +1257,10 @@ static int clone_submodule(const char *path, const char *gitdir, const char *url
 		argv_array_push(&cp.args, "--dissociate");
 	if (gitdir && *gitdir)
 		argv_array_pushl(&cp.args, "--separate-git-dir", gitdir, NULL);
+	if (single_branch >= 0)
+		argv_array_push(&cp.args, single_branch ?
+					  "--single-branch" :
+					  "--no-single-branch");
 
 	argv_array_push(&cp.args, "--");
 	argv_array_push(&cp.args, url);
@@ -1267,6 +1284,13 @@ struct submodule_alternate_setup {
 };
 #define SUBMODULE_ALTERNATE_SETUP_INIT { NULL, \
 	SUBMODULE_ALTERNATE_ERROR_IGNORE, NULL }
+
+static const char alternate_error_advice[] = N_(
+"An alternate computed from a superproject's alternate is invalid.\n"
+"To allow Git to clone without an alternate in such a case, set\n"
+"submodule.alternateErrorStrategy to 'info' or, equivalently, clone with\n"
+"'--reference-if-able' instead of '--reference'."
+);
 
 static int add_possible_reference_from_superproject(
 		struct object_directory *odb, void *sas_cb)
@@ -1299,6 +1323,8 @@ static int add_possible_reference_from_superproject(
 		} else {
 			switch (sas->error_mode) {
 			case SUBMODULE_ALTERNATE_ERROR_DIE:
+				if (advice_submodule_alternate_error_strategy_die)
+					advise(_(alternate_error_advice));
 				die(_("submodule '%s' cannot add alternate: %s"),
 				    sas->submodule_name, err.buf);
 			case SUBMODULE_ALTERNATE_ERROR_INFO:
@@ -1359,8 +1385,9 @@ static int module_clone(int argc, const char **argv, const char *prefix)
 	char *p, *path = NULL, *sm_gitdir;
 	struct strbuf sb = STRBUF_INIT;
 	struct string_list reference = STRING_LIST_INIT_NODUP;
-	int dissociate = 0;
+	int dissociate = 0, require_init = 0;
 	char *sm_alternate = NULL, *error_strategy = NULL;
+	int single_branch = -1;
 
 	struct option module_clone_options[] = {
 		OPT_STRING(0, "prefix", &prefix,
@@ -1386,12 +1413,17 @@ static int module_clone(int argc, const char **argv, const char *prefix)
 		OPT__QUIET(&quiet, "Suppress output for cloning a submodule"),
 		OPT_BOOL(0, "progress", &progress,
 			   N_("force cloning progress")),
+		OPT_BOOL(0, "require-init", &require_init,
+			   N_("disallow cloning into non-empty directory")),
+		OPT_BOOL(0, "single-branch", &single_branch,
+			 N_("clone only one branch, HEAD or --branch")),
 		OPT_END()
 	};
 
 	const char *const git_submodule_helper_usage[] = {
 		N_("git submodule--helper clone [--prefix=<path>] [--quiet] "
 		   "[--reference <repository>] [--name <name>] [--depth <depth>] "
+		   "[--single-branch] "
 		   "--url <url> --path <path>"),
 		NULL
 	};
@@ -1413,6 +1445,10 @@ static int module_clone(int argc, const char **argv, const char *prefix)
 	} else
 		path = xstrdup(path);
 
+	if (validate_submodule_git_dir(sm_gitdir, name) < 0)
+		die(_("refusing to create/use '%s' in another submodule's "
+			"git dir"), sm_gitdir);
+
 	if (!file_exists(sm_gitdir)) {
 		if (safe_create_leading_directories_const(sm_gitdir) < 0)
 			die(_("could not create directory '%s'"), sm_gitdir);
@@ -1420,10 +1456,12 @@ static int module_clone(int argc, const char **argv, const char *prefix)
 		prepare_possible_alternates(name, &reference);
 
 		if (clone_submodule(path, sm_gitdir, url, depth, &reference, dissociate,
-				    quiet, progress))
+				    quiet, progress, single_branch))
 			die(_("clone of '%s' into submodule path '%s' failed"),
 			    url, path);
 	} else {
+		if (require_init && !access(path, X_OK) && !is_empty_dir(path))
+			die(_("directory not empty: '%s'"), path);
 		if (safe_create_leading_directories_const(path) < 0)
 			die(_("could not create directory '%s'"), path);
 		strbuf_addf(&sb, "%s/index", sm_gitdir);
@@ -1478,6 +1516,8 @@ static void determine_submodule_update_strategy(struct repository *r,
 			die(_("Invalid update mode '%s' configured for submodule path '%s'"),
 				val, path);
 	} else if (sub->update_strategy.type != SM_UPDATE_UNSPECIFIED) {
+		if (sub->update_strategy.type == SM_UPDATE_COMMAND)
+			BUG("how did we read update = !command from .gitmodules?");
 		out->type = sub->update_strategy.type;
 		out->command = sub->update_strategy.command;
 	} else
@@ -1536,9 +1576,11 @@ struct submodule_update_clone {
 	int recommend_shallow;
 	struct string_list references;
 	int dissociate;
+	unsigned require_init;
 	const char *depth;
 	const char *recursive_prefix;
 	const char *prefix;
+	int single_branch;
 
 	/* to be consumed by git-submodule.sh */
 	struct update_clone_data *update_clone;
@@ -1553,10 +1595,14 @@ struct submodule_update_clone {
 
 	int max_jobs;
 };
-#define SUBMODULE_UPDATE_CLONE_INIT {0, MODULE_LIST_INIT, 0, \
-	SUBMODULE_UPDATE_STRATEGY_INIT, 0, 0, -1, STRING_LIST_INIT_DUP, 0, \
-	NULL, NULL, NULL, \
-	NULL, 0, 0, 0, NULL, 0, 0, 1}
+#define SUBMODULE_UPDATE_CLONE_INIT { \
+	.list = MODULE_LIST_INIT, \
+	.update = SUBMODULE_UPDATE_STRATEGY_INIT, \
+	.recommend_shallow = -1, \
+	.references = STRING_LIST_INIT_DUP, \
+	.single_branch = -1, \
+	.max_jobs = 1, \
+}
 
 
 static void next_submodule_warn_missing(struct submodule_update_clone *suc,
@@ -1681,6 +1727,8 @@ static int prepare_to_clone_next_submodule(const struct cache_entry *ce,
 		argv_array_pushl(&child->args, "--prefix", suc->prefix, NULL);
 	if (suc->recommend_shallow && sub->recommend_shallow == 1)
 		argv_array_push(&child->args, "--depth=1");
+	if (suc->require_init)
+		argv_array_push(&child->args, "--require-init");
 	argv_array_pushl(&child->args, "--path", sub->path, NULL);
 	argv_array_pushl(&child->args, "--name", sub->name, NULL);
 	argv_array_pushl(&child->args, "--url", url, NULL);
@@ -1693,6 +1741,10 @@ static int prepare_to_clone_next_submodule(const struct cache_entry *ce,
 		argv_array_push(&child->args, "--dissociate");
 	if (suc->depth)
 		argv_array_push(&child->args, suc->depth);
+	if (suc->single_branch >= 0)
+		argv_array_push(&child->args, suc->single_branch ?
+					      "--single-branch" :
+					      "--no-single-branch");
 
 cleanup:
 	strbuf_reset(&displaypath_sb);
@@ -1870,11 +1922,15 @@ static int update_clone(int argc, const char **argv, const char *prefix)
 		OPT__QUIET(&suc.quiet, N_("don't print cloning progress")),
 		OPT_BOOL(0, "progress", &suc.progress,
 			    N_("force cloning progress")),
+		OPT_BOOL(0, "require-init", &suc.require_init,
+			   N_("disallow cloning into non-empty directory")),
+		OPT_BOOL(0, "single-branch", &suc.single_branch,
+			 N_("clone only one branch, HEAD or --branch")),
 		OPT_END()
 	};
 
 	const char *const git_submodule_helper_usage[] = {
-		N_("git submodule--helper update_clone [--prefix=<path>] [<path>...]"),
+		N_("git submodule--helper update-clone [--prefix=<path>] [<path>...]"),
 		NULL
 	};
 	suc.prefix = prefix;
@@ -1925,7 +1981,7 @@ static const char *remote_submodule_branch(const char *path)
 	free(key);
 
 	if (!branch)
-		return "master";
+		return "HEAD";
 
 	if (!strcmp(branch, ".")) {
 		const char *refname = resolve_ref_unsafe("HEAD", 0, NULL, NULL);
@@ -2190,6 +2246,80 @@ static int module_config(int argc, const char **argv, const char *prefix)
 	usage_with_options(git_submodule_helper_usage, module_config_options);
 }
 
+static int module_set_url(int argc, const char **argv, const char *prefix)
+{
+	int quiet = 0;
+	const char *newurl;
+	const char *path;
+	char *config_name;
+
+	struct option options[] = {
+		OPT__QUIET(&quiet, N_("Suppress output for setting url of a submodule")),
+		OPT_END()
+	};
+	const char *const usage[] = {
+		N_("git submodule--helper set-url [--quiet] <path> <newurl>"),
+		NULL
+	};
+
+	argc = parse_options(argc, argv, prefix, options, usage, 0);
+
+	if (argc != 2 || !(path = argv[0]) || !(newurl = argv[1]))
+		usage_with_options(usage, options);
+
+	config_name = xstrfmt("submodule.%s.url", path);
+
+	config_set_in_gitmodules_file_gently(config_name, newurl);
+	sync_submodule(path, prefix, quiet ? OPT_QUIET : 0);
+
+	free(config_name);
+
+	return 0;
+}
+
+static int module_set_branch(int argc, const char **argv, const char *prefix)
+{
+	int opt_default = 0, ret;
+	const char *opt_branch = NULL;
+	const char *path;
+	char *config_name;
+
+	/*
+	 * We accept the `quiet` option for uniformity across subcommands,
+	 * though there is nothing to make less verbose in this subcommand.
+	 */
+	struct option options[] = {
+		OPT_NOOP_NOARG('q', "quiet"),
+		OPT_BOOL('d', "default", &opt_default,
+			N_("set the default tracking branch to master")),
+		OPT_STRING('b', "branch", &opt_branch, N_("branch"),
+			N_("set the default tracking branch")),
+		OPT_END()
+	};
+	const char *const usage[] = {
+		N_("git submodule--helper set-branch [-q|--quiet] (-d|--default) <path>"),
+		N_("git submodule--helper set-branch [-q|--quiet] (-b|--branch) <branch> <path>"),
+		NULL
+	};
+
+	argc = parse_options(argc, argv, prefix, options, usage, 0);
+
+	if (!opt_branch && !opt_default)
+		die(_("--branch or --default required"));
+
+	if (opt_branch && opt_default)
+		die(_("--branch and --default are mutually exclusive"));
+
+	if (argc != 1 || !(path = argv[0]))
+		usage_with_options(usage, options);
+
+	config_name = xstrfmt("submodule.%s.branch", path);
+	ret = config_set_in_gitmodules_file_gently(config_name, opt_branch);
+
+	free(config_name);
+	return !!ret;
+}
+
 #define SUPPORT_SUPER_PREFIX (1<<0)
 
 struct cmd_struct {
@@ -2220,6 +2350,8 @@ static struct cmd_struct commands[] = {
 	{"is-active", is_active, 0},
 	{"check-name", check_name, 0},
 	{"config", module_config, 0},
+	{"set-url", module_set_url, 0},
+	{"set-branch", module_set_branch, 0},
 };
 
 int cmd_submodule__helper(int argc, const char **argv, const char *prefix)

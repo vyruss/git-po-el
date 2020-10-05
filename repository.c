@@ -89,6 +89,10 @@ void repo_set_gitdir(struct repository *repo,
 void repo_set_hash_algo(struct repository *repo, int hash_algo)
 {
 	repo->hash_algo = &hash_algos[hash_algo];
+#ifndef ENABLE_SHA256
+	if (hash_algo != GIT_HASH_SHA1)
+		die(_("The hash algorithm %s is not supported in this build."), repo->hash_algo->name);
+#endif
 }
 
 /*
@@ -200,9 +204,9 @@ int repo_submodule_init(struct repository *subrepo,
 
 	if (repo_init(subrepo, gitdir.buf, worktree.buf)) {
 		/*
-		 * If initilization fails then it may be due to the submodule
+		 * If initialization fails then it may be due to the submodule
 		 * not being populated in the superproject's worktree.  Instead
-		 * we can try to initilize the submodule by finding it's gitdir
+		 * we can try to initialize the submodule by finding it's gitdir
 		 * in the superproject's 'modules' directory.  In this case the
 		 * submodule would not have a worktree.
 		 */

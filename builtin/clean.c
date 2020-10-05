@@ -18,6 +18,7 @@
 #include "color.h"
 #include "pathspec.h"
 #include "help.h"
+#include "prompt.h"
 
 static int force = -1; /* unset */
 static int interactive;
@@ -158,7 +159,8 @@ static int remove_dirs(struct strbuf *path, const char *prefix, int force_flag,
 
 	*dir_gone = 1;
 
-	if ((force_flag & REMOVE_DIR_KEEP_NESTED_GIT) && is_nonbare_repository_dir(path)) {
+	if ((force_flag & REMOVE_DIR_KEEP_NESTED_GIT) &&
+	    is_nonbare_repository_dir(path)) {
 		if (!quiet) {
 			quote_path_relative(path->buf, prefix, &quoted);
 			printf(dry_run ?  _(msg_would_skip_git_dir) : _(msg_skip_git_dir),
@@ -419,7 +421,6 @@ static int find_unique(const char *choice, struct menu_stuff *menu_stuff)
 	return found;
 }
 
-
 /*
  * Parse user input, and return choice(s) for menu (menu_stuff).
  *
@@ -579,9 +580,7 @@ static int *list_and_choose(struct menu_opts *opts, struct menu_stuff *stuff)
 			       clean_get_color(CLEAN_COLOR_RESET));
 		}
 
-		if (strbuf_getline_lf(&choice, stdin) != EOF) {
-			strbuf_trim(&choice);
-		} else {
+		if (git_read_line_interactively(&choice) == EOF) {
 			eof = 1;
 			break;
 		}
@@ -648,7 +647,7 @@ static int filter_by_patterns_cmd(void)
 	struct strbuf confirm = STRBUF_INIT;
 	struct strbuf **ignore_list;
 	struct string_list_item *item;
-	struct exclude_list *el;
+	struct pattern_list *pl;
 	int changed = -1, i;
 
 	for (;;) {
@@ -661,9 +660,7 @@ static int filter_by_patterns_cmd(void)
 		clean_print_color(CLEAN_COLOR_PROMPT);
 		printf(_("Input ignore patterns>> "));
 		clean_print_color(CLEAN_COLOR_RESET);
-		if (strbuf_getline_lf(&confirm, stdin) != EOF)
-			strbuf_trim(&confirm);
-		else
+		if (git_read_line_interactively(&confirm) == EOF)
 			putchar('\n');
 
 		/* quit filter_by_pattern mode if press ENTER or Ctrl-D */
@@ -671,7 +668,7 @@ static int filter_by_patterns_cmd(void)
 			break;
 
 		memset(&dir, 0, sizeof(dir));
-		el = add_exclude_list(&dir, EXC_CMDL, "manual exclude");
+		pl = add_pattern_list(&dir, EXC_CMDL, "manual exclude");
 		ignore_list = strbuf_split_max(&confirm, ' ', 0);
 
 		for (i = 0; ignore_list[i]; i++) {
@@ -679,7 +676,7 @@ static int filter_by_patterns_cmd(void)
 			if (!ignore_list[i]->len)
 				continue;
 
-			add_exclude(ignore_list[i]->buf, "", 0, el, -(i+1));
+			add_pattern(ignore_list[i]->buf, "", 0, pl, -(i+1));
 		}
 
 		changed = 0;
@@ -759,9 +756,7 @@ static int ask_each_cmd(void)
 			qname = quote_path_relative(item->string, NULL, &buf);
 			/* TRANSLATORS: Make sure to keep [y/N] as is */
 			printf(_("Remove %s [y/N]? "), qname);
-			if (strbuf_getline_lf(&confirm, stdin) != EOF) {
-				strbuf_trim(&confirm);
-			} else {
+			if (git_read_line_interactively(&confirm) == EOF) {
 				putchar('\n');
 				eof = 1;
 			}
@@ -901,7 +896,7 @@ int cmd_clean(int argc, const char **argv, const char *prefix)
 	struct pathspec pathspec;
 	struct strbuf buf = STRBUF_INIT;
 	struct string_list exclude_list = STRING_LIST_INIT_NODUP;
-	struct exclude_list *el;
+	struct pattern_list *pl;
 	struct string_list_item *item;
 	const char *qname;
 	struct option options[] = {
@@ -911,8 +906,8 @@ int cmd_clean(int argc, const char **argv, const char *prefix)
 		OPT_BOOL('i', "interactive", &interactive, N_("interactive cleaning")),
 		OPT_BOOL('d', NULL, &remove_directories,
 				N_("remove whole directories")),
-		{ OPTION_CALLBACK, 'e', "exclude", &exclude_list, N_("pattern"),
-		  N_("add <pattern> to ignore rules"), PARSE_OPT_NONEG, exclude_cb },
+		OPT_CALLBACK_F('e', "exclude", &exclude_list, N_("pattern"),
+		  N_("add <pattern> to ignore rules"), PARSE_OPT_NONEG, exclude_cb),
 		OPT_BOOL('x', NULL, &ignored, N_("remove ignored files, too")),
 		OPT_BOOL('X', NULL, &ignored_only,
 				N_("remove only ignored files")),
@@ -929,12 +924,6 @@ int cmd_clean(int argc, const char **argv, const char *prefix)
 			     0);
 
 	memset(&dir, 0, sizeof(dir));
-	if (ignored_only)
-		dir.flags |= DIR_SHOW_IGNORED;
-
-	if (ignored && ignored_only)
-		die(_("-x and -X cannot be used together"));
-
 	if (!interactive && !dry_run && !force) {
 		if (config_set)
 			die(_("clean.requireForce set to true and neither -i, -n, nor -f given; "
@@ -946,21 +935,64 @@ int cmd_clean(int argc, const char **argv, const char *prefix)
 
 	if (force > 1)
 		rm_flags = 0;
+	else
+		dir.flags |= DIR_SKIP_NESTED_GIT;
 
 	dir.flags |= DIR_SHOW_OTHER_DIRECTORIES;
 
-	if (remove_directories)
-		dir.flags |= DIR_SHOW_IGNORED_TOO | DIR_KEEP_UNTRACKED_CONTENTS;
+	if (ignored && ignored_only)
+		die(_("-x and -X cannot be used together"));
+	if (!ignored)
+		setup_standard_excludes(&dir);
+	if (ignored_only)
+		dir.flags |= DIR_SHOW_IGNORED;
+
+	if (argc) {
+		/*
+		 * Remaining args implies pathspecs specified, and we should
+		 * recurse within those.
+		 */
+		remove_directories = 1;
+	}
+
+	if (remove_directories && !ignored_only) {
+		/*
+		 * We need to know about ignored files too:
+		 *
+		 * If (ignored), then we will delete ignored files as well.
+		 *
+		 * If (!ignored), then even though we not are doing
+		 * anything with ignored files, we need to know about them
+		 * so that we can avoid deleting a directory of untracked
+		 * files that also contains an ignored file within it.
+		 *
+		 * For the (!ignored) case, since we only need to avoid
+		 * deleting ignored files, we can set
+		 * DIR_SHOW_IGNORED_TOO_MODE_MATCHING in order to avoid
+		 * recursing into a directory which is itself ignored.
+		 */
+		dir.flags |= DIR_SHOW_IGNORED_TOO;
+		if (!ignored)
+			dir.flags |= DIR_SHOW_IGNORED_TOO_MODE_MATCHING;
+
+		/*
+		 * Let the fill_directory() machinery know that we aren't
+		 * just recursing to collect the ignored files; we want all
+		 * the untracked ones so that we can delete them.  (Note:
+		 * we could also set DIR_KEEP_UNTRACKED_CONTENTS when
+		 * ignored_only is true, since DIR_KEEP_UNTRACKED_CONTENTS
+		 * only has effect in combination with DIR_SHOW_IGNORED_TOO.  It makes
+		 * the code clearer to exclude it, though.
+		 */
+		dir.flags |= DIR_KEEP_UNTRACKED_CONTENTS;
+	}
 
 	if (read_cache() < 0)
 		die(_("index file corrupt"));
 
-	if (!ignored)
-		setup_standard_excludes(&dir);
-
-	el = add_exclude_list(&dir, EXC_CMDL, "--exclude option");
+	pl = add_pattern_list(&dir, EXC_CMDL, "--exclude option");
 	for (i = 0; i < exclude_list.nr; i++)
-		add_exclude(exclude_list.items[i].string, "", 0, el, -(i+1));
+		add_pattern(exclude_list.items[i].string, "", 0, pl, -(i+1));
 
 	parse_pathspec(&pathspec, 0,
 		       PATHSPEC_PREFER_CWD,
@@ -976,12 +1008,6 @@ int cmd_clean(int argc, const char **argv, const char *prefix)
 		const char *rel;
 
 		if (!cache_name_is_other(ent->name, ent->len))
-			continue;
-
-		if (pathspec.nr)
-			matches = dir_path_match(&the_index, ent, &pathspec, 0, NULL);
-
-		if (pathspec.nr && !matches)
 			continue;
 
 		if (lstat(ent->name, &st))
@@ -1007,6 +1033,7 @@ int cmd_clean(int argc, const char **argv, const char *prefix)
 	for_each_string_list_item(item, &del_list) {
 		struct stat st;
 
+		strbuf_reset(&abs_path);
 		if (prefix)
 			strbuf_addstr(&abs_path, prefix);
 
@@ -1040,7 +1067,6 @@ int cmd_clean(int argc, const char **argv, const char *prefix)
 				printf(dry_run ? _(msg_would_remove) : _(msg_remove), qname);
 			}
 		}
-		strbuf_reset(&abs_path);
 	}
 
 	strbuf_release(&abs_path);

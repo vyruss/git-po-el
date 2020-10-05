@@ -8,7 +8,7 @@
 #include "refs.h"
 #include "remote.h"
 #include "dir.h"
-#include "sha1-array.h"
+#include "oid-array.h"
 #include "packfile.h"
 #include "object-store.h"
 #include "repository.h"
@@ -155,7 +155,6 @@ static void unique_in_pack(struct packed_git *p,
 			   struct disambiguate_state *ds)
 {
 	uint32_t num, i, first = 0;
-	const struct object_id *current = NULL;
 
 	if (p->multi_pack_index)
 		return;
@@ -173,10 +172,10 @@ static void unique_in_pack(struct packed_git *p,
 	 */
 	for (i = first; i < num && !ds->ambiguous; i++) {
 		struct object_id oid;
-		current = nth_packed_object_oid(&oid, p, i);
-		if (!match_sha(ds->len, ds->bin_pfx.hash, current->hash))
+		nth_packed_object_id(&oid, p, i);
+		if (!match_sha(ds->len, ds->bin_pfx.hash, oid.hash))
 			break;
-		update_candidates(ds, current);
+		update_candidates(ds, &oid);
 	}
 }
 
@@ -403,9 +402,9 @@ static int repo_collect_ambiguous(struct repository *r,
 	return collect_ambiguous(oid, data);
 }
 
-static struct repository *sort_ambiguous_repo;
-static int sort_ambiguous(const void *a, const void *b)
+static int sort_ambiguous(const void *a, const void *b, void *ctx)
 {
+	struct repository *sort_ambiguous_repo = ctx;
 	int a_type = oid_object_info(sort_ambiguous_repo, a, NULL);
 	int b_type = oid_object_info(sort_ambiguous_repo, b, NULL);
 	int a_type_sort;
@@ -434,10 +433,7 @@ static int sort_ambiguous(const void *a, const void *b)
 
 static void sort_ambiguous_oid_array(struct repository *r, struct oid_array *a)
 {
-	/* mutex will be needed if this code is to be made thread safe */
-	sort_ambiguous_repo = r;
-	QSORT(a->oid, a->nr, sort_ambiguous);
-	sort_ambiguous_repo = NULL;
+	QSORT_S(a->oid, a->nr, sort_ambiguous, r);
 }
 
 static enum get_oid_result get_short_oid(struct repository *r,
@@ -646,14 +642,14 @@ static void find_abbrev_len_for_pack(struct packed_git *p,
 	 */
 	mad->init_len = 0;
 	if (!match) {
-		if (nth_packed_object_oid(&oid, p, first))
+		if (!nth_packed_object_id(&oid, p, first))
 			extend_abbrev_len(&oid, mad);
 	} else if (first < num - 1) {
-		if (nth_packed_object_oid(&oid, p, first + 1))
+		if (!nth_packed_object_id(&oid, p, first + 1))
 			extend_abbrev_len(&oid, mad);
 	}
 	if (first > 0) {
-		if (nth_packed_object_oid(&oid, p, first - 1))
+		if (!nth_packed_object_id(&oid, p, first - 1))
 			extend_abbrev_len(&oid, mad);
 	}
 	mad->init_len = mad->cur_len;
@@ -911,26 +907,21 @@ static int get_oid_basic(struct repository *r, const char *str, int len,
 				real_ref, flags, at_time, nth, oid, NULL,
 				&co_time, &co_tz, &co_cnt)) {
 			if (!len) {
-				if (starts_with(real_ref, "refs/heads/")) {
-					str = real_ref + 11;
-					len = strlen(real_ref + 11);
-				} else {
-					/* detached HEAD */
+				if (!skip_prefix(real_ref, "refs/heads/", &str))
 					str = "HEAD";
-					len = 4;
-				}
+				len = strlen(str);
 			}
 			if (at_time) {
 				if (!(flags & GET_OID_QUIETLY)) {
-					warning("Log for '%.*s' only goes "
-						"back to %s.", len, str,
+					warning(_("log for '%.*s' only goes back to %s"),
+						len, str,
 						show_date(co_time, co_tz, DATE_MODE(RFC2822)));
 				}
 			} else {
 				if (flags & GET_OID_QUIETLY) {
 					exit(128);
 				}
-				die("Log for '%.*s' only has %d entries.",
+				die(_("log for '%.*s' only has %d entries"),
 				    len, str, co_cnt);
 			}
 		}
@@ -1163,13 +1154,22 @@ static enum get_oid_result get_oid_1(struct repository *r,
 	}
 
 	if (has_suffix) {
-		int num = 0;
+		unsigned int num = 0;
 		int len1 = cp - name;
 		cp++;
-		while (cp < name + len)
-			num = num * 10 + *cp++ - '0';
+		while (cp < name + len) {
+			unsigned int digit = *cp++ - '0';
+			if (unsigned_mult_overflows(num, 10))
+				return MISSING_OBJECT;
+			num *= 10;
+			if (unsigned_add_overflows(num, digit))
+				return MISSING_OBJECT;
+			num += digit;
+		}
 		if (!num && len1 == len - 1)
 			num = 1;
+		else if (num > INT_MAX)
+			return MISSING_OBJECT;
 		if (has_suffix == '^')
 			return get_parent(r, name, len1, oid, num);
 		/* else if (has_suffix == '~') -- goes without saying */
@@ -1289,7 +1289,7 @@ static int get_oid_oneline(struct repository *r,
 
 struct grab_nth_branch_switch_cbdata {
 	int remaining;
-	struct strbuf buf;
+	struct strbuf *sb;
 };
 
 static int grab_nth_branch_switch(struct object_id *ooid, struct object_id *noid,
@@ -1307,8 +1307,8 @@ static int grab_nth_branch_switch(struct object_id *ooid, struct object_id *noid
 		return 0;
 	if (--(cb->remaining) == 0) {
 		len = target - match;
-		strbuf_reset(&cb->buf);
-		strbuf_add(&cb->buf, match, len);
+		strbuf_reset(cb->sb);
+		strbuf_add(cb->sb, match, len);
 		return 1; /* we are done */
 	}
 	return 0;
@@ -1341,18 +1341,15 @@ static int interpret_nth_prior_checkout(struct repository *r,
 	if (nth <= 0)
 		return -1;
 	cb.remaining = nth;
-	strbuf_init(&cb.buf, 20);
+	cb.sb = buf;
 
 	retval = refs_for_each_reflog_ent_reverse(get_main_ref_store(r),
 			"HEAD", grab_nth_branch_switch, &cb);
 	if (0 < retval) {
-		strbuf_reset(buf);
-		strbuf_addbuf(buf, &cb.buf);
 		retval = brace - name + 1;
 	} else
 		retval = 0;
 
-	strbuf_release(&cb.buf);
 	return retval;
 }
 
@@ -1689,14 +1686,14 @@ static void diagnose_invalid_oid_path(struct repository *r,
 		prefix = "";
 
 	if (file_exists(filename))
-		die("Path '%s' exists on disk, but not in '%.*s'.",
+		die(_("path '%s' exists on disk, but not in '%.*s'"),
 		    filename, object_name_len, object_name);
 	if (is_missing_file_error(errno)) {
 		char *fullname = xstrfmt("%s%s", prefix, filename);
 
 		if (!get_tree_entry(r, tree_oid, fullname, &oid, &mode)) {
-			die("Path '%s' exists, but not '%s'.\n"
-			    "Did you mean '%.*s:%s' aka '%.*s:./%s'?",
+			die(_("path '%s' exists, but not '%s'\n"
+			    "hint: Did you mean '%.*s:%s' aka '%.*s:./%s'?"),
 			    fullname,
 			    filename,
 			    object_name_len, object_name,
@@ -1704,7 +1701,7 @@ static void diagnose_invalid_oid_path(struct repository *r,
 			    object_name_len, object_name,
 			    filename);
 		}
-		die("Path '%s' does not exist in '%.*s'",
+		die(_("path '%s' does not exist in '%.*s'"),
 		    filename, object_name_len, object_name);
 	}
 }
@@ -1732,8 +1729,8 @@ static void diagnose_invalid_index_path(struct repository *r,
 		ce = istate->cache[pos];
 		if (ce_namelen(ce) == namelen &&
 		    !memcmp(ce->name, filename, namelen))
-			die("Path '%s' is in the index, but not at stage %d.\n"
-			    "Did you mean ':%d:%s'?",
+			die(_("path '%s' is in the index, but not at stage %d\n"
+			    "hint: Did you mean ':%d:%s'?"),
 			    filename, stage,
 			    ce_stage(ce), filename);
 	}
@@ -1748,17 +1745,17 @@ static void diagnose_invalid_index_path(struct repository *r,
 		ce = istate->cache[pos];
 		if (ce_namelen(ce) == fullname.len &&
 		    !memcmp(ce->name, fullname.buf, fullname.len))
-			die("Path '%s' is in the index, but not '%s'.\n"
-			    "Did you mean ':%d:%s' aka ':%d:./%s'?",
+			die(_("path '%s' is in the index, but not '%s'\n"
+			    "hint: Did you mean ':%d:%s' aka ':%d:./%s'?"),
 			    fullname.buf, filename,
 			    ce_stage(ce), fullname.buf,
 			    ce_stage(ce), filename);
 	}
 
 	if (repo_file_exists(r, filename))
-		die("Path '%s' exists on disk, but not in the index.", filename);
+		die(_("path '%s' exists on disk, but not in the index"), filename);
 	if (is_missing_file_error(errno))
-		die("Path '%s' does not exist (neither on disk nor in the index).",
+		die(_("path '%s' does not exist (neither on disk nor in the index)"),
 		    filename);
 
 	strbuf_release(&fullname);
@@ -1771,7 +1768,7 @@ static char *resolve_relative_path(struct repository *r, const char *rel)
 		return NULL;
 
 	if (r != the_repository || !is_inside_work_tree())
-		die("relative path syntax can't be used outside working tree.");
+		die(_("relative path syntax can't be used outside working tree"));
 
 	/* die() inside prefix_path() if resolved path is outside worktree */
 	return prefix_path(startup_info->prefix,
@@ -1818,8 +1815,8 @@ static enum get_oid_result get_oid_with_context_1(struct repository *repo,
 
 			cb.repo = repo;
 			cb.list = &list;
-			refs_for_each_ref(repo->refs, handle_one_ref, &cb);
-			refs_head_ref(repo->refs, handle_one_ref, &cb);
+			refs_for_each_ref(get_main_ref_store(repo), handle_one_ref, &cb);
+			refs_head_ref(get_main_ref_store(repo), handle_one_ref, &cb);
 			commit_list_sort_by_date(&list);
 			return get_oid_oneline(repo, name + 2, oid, list);
 		}
@@ -1909,7 +1906,7 @@ static enum get_oid_result get_oid_with_context_1(struct repository *repo,
 			return ret;
 		} else {
 			if (only_to_die)
-				die("Invalid object name '%.*s'.", len, name);
+				die(_("invalid object name '%.*s'."), len, name);
 		}
 	}
 	return ret;

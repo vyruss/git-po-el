@@ -546,7 +546,7 @@ static HANDLE swap_osfhnd(int fd, HANDLE new_handle)
 typedef struct _OBJECT_NAME_INFORMATION
 {
 	UNICODE_STRING Name;
-	WCHAR NameBuffer[0];
+	WCHAR NameBuffer[FLEX_ARRAY];
 } OBJECT_NAME_INFORMATION, *POBJECT_NAME_INFORMATION;
 
 #define ObjectNameInformation 1
@@ -662,10 +662,20 @@ void winansi_init(void)
  */
 HANDLE winansi_get_osfhandle(int fd)
 {
+	HANDLE ret;
+
 	if (fd == 1 && (fd_is_interactive[1] & FD_SWAPPED))
 		return hconsole1;
 	if (fd == 2 && (fd_is_interactive[2] & FD_SWAPPED))
 		return hconsole2;
 
-	return (HANDLE)_get_osfhandle(fd);
+	ret = (HANDLE)_get_osfhandle(fd);
+
+	/*
+	 * There are obviously circumstances under which _get_osfhandle()
+	 * returns (HANDLE)-2. This is not documented anywhere, but that is so
+	 * clearly an invalid handle value that we can just work around this
+	 * and return the correct value for invalid handles.
+	 */
+	return ret == (HANDLE)-2 ? INVALID_HANDLE_VALUE : ret;
 }

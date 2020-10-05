@@ -567,13 +567,13 @@ To illustrate the difference between `-S<regex> --pickaxe-regex` and
 file:
 +
 ----
-+    return !regexec(regexp, two->ptr, 1, &regmatch, 0);
++    return frotz(nitfol, two->ptr, 1, 0);
 ...
--    hit = !regexec(regexp, mf2.ptr, 1, &regmatch, 0);
+-    hit = frotz(nitfol, mf2.ptr, 1, 0);
 ----
 +
-While `git log -G"regexec\(regexp"` will show this commit, `git log
--S"regexec\(regexp" --pickaxe-regex` will not (because the number of
+While `git log -G"frotz\(nitfol"` will show this commit, `git log
+-S"frotz\(nitfol" --pickaxe-regex` will not (because the number of
 occurrences of that string did not change).
 +
 Unless `--text` is supplied patches of binary files without a textconv
@@ -643,15 +643,18 @@ ifndef::git-format-patch[]
 -R::
 	Swap two inputs; that is, show differences from index or
 	on-disk file to tree contents.
+endif::git-format-patch[]
 
 --relative[=<path>]::
+--no-relative::
 	When run from a subdirectory of the project, it can be
 	told to exclude changes outside the directory and show
 	pathnames relative to it with this option.  When you are
 	not in a subdirectory (e.g. in a bare repository), you
 	can name which subdirectory to make the output relative
 	to by giving a <path> as an argument.
-endif::git-format-patch[]
+	`--no-relative` can be used to countermand both `diff.relative` config
+	option and previous `--relative`.
 
 -a::
 --text::

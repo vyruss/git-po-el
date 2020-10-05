@@ -23,6 +23,17 @@ static void add_to_ref_list(const struct object_id *oid, const char *name,
 	list->nr++;
 }
 
+static const struct git_hash_algo *detect_hash_algo(struct strbuf *buf)
+{
+	size_t len = strcspn(buf->buf, " \n");
+	int algo;
+
+	algo = hash_algo_by_length(len / 2);
+	if (algo == GIT_HASH_UNKNOWN)
+		return NULL;
+	return &hash_algos[algo];
+}
+
 static int parse_bundle_header(int fd, struct bundle_header *header,
 			       const char *report_path)
 {
@@ -52,12 +63,21 @@ static int parse_bundle_header(int fd, struct bundle_header *header,
 		}
 		strbuf_rtrim(&buf);
 
+		if (!header->hash_algo) {
+			header->hash_algo = detect_hash_algo(&buf);
+			if (!header->hash_algo) {
+				error(_("unknown hash algorithm length"));
+				status = -1;
+				break;
+			}
+		}
+
 		/*
 		 * Tip lines have object name, SP, and refname.
 		 * Prerequisites have object name that is optionally
 		 * followed by SP and subject line.
 		 */
-		if (parse_oid_hex(buf.buf, &oid, &p) ||
+		if (parse_oid_hex_algop(buf.buf, &oid, &p, header->hash_algo) ||
 		    (*p && !isspace(*p)) ||
 		    (!is_prereq && !*p)) {
 			if (report_path)
@@ -249,15 +269,16 @@ out:
 
 
 /* Write the pack data to bundle_fd */
-static int write_pack_data(int bundle_fd, struct rev_info *revs)
+static int write_pack_data(int bundle_fd, struct rev_info *revs, struct argv_array *pack_options)
 {
 	struct child_process pack_objects = CHILD_PROCESS_INIT;
 	int i;
 
 	argv_array_pushl(&pack_objects.args,
-			 "pack-objects", "--all-progress-implied",
+			 "pack-objects",
 			 "--stdout", "--thin", "--delta-base-offset",
 			 NULL);
+	argv_array_pushv(&pack_objects.args, pack_options->argv);
 	pack_objects.in = -1;
 	pack_objects.out = bundle_fd;
 	pack_objects.git_cmd = 1;
@@ -282,7 +303,7 @@ static int write_pack_data(int bundle_fd, struct rev_info *revs)
 		struct object *object = revs->pending.objects[i].item;
 		if (object->flags & UNINTERESTING)
 			write_or_die(pack_objects.in, "^", 1);
-		write_or_die(pack_objects.in, oid_to_hex(&object->oid), GIT_SHA1_HEXSZ);
+		write_or_die(pack_objects.in, oid_to_hex(&object->oid), the_hash_algo->hexsz);
 		write_or_die(pack_objects.in, "\n", 1);
 	}
 	close(pack_objects.in);
@@ -414,7 +435,7 @@ static int write_bundle_refs(int bundle_fd, struct rev_info *revs)
 		}
 
 		ref_count++;
-		write_or_die(bundle_fd, oid_to_hex(&e->item->oid), 40);
+		write_or_die(bundle_fd, oid_to_hex(&e->item->oid), the_hash_algo->hexsz);
 		write_or_die(bundle_fd, " ", 1);
 		write_or_die(bundle_fd, display_ref, strlen(display_ref));
 		write_or_die(bundle_fd, "\n", 1);
@@ -428,7 +449,7 @@ static int write_bundle_refs(int bundle_fd, struct rev_info *revs)
 }
 
 int create_bundle(struct repository *r, const char *path,
-		  int argc, const char **argv)
+		  int argc, const char **argv, struct argv_array *pack_options)
 {
 	struct lock_file lock = LOCK_INIT;
 	int bundle_fd = -1;
@@ -470,7 +491,7 @@ int create_bundle(struct repository *r, const char *path,
 		goto err;
 
 	/* write pack */
-	if (write_pack_data(bundle_fd, &revs))
+	if (write_pack_data(bundle_fd, &revs, pack_options))
 		goto err;
 
 	if (!bundle_to_stdout) {

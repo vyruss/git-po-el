@@ -722,16 +722,14 @@ static void wt_status_collect_untracked(struct wt_status *s)
 
 	for (i = 0; i < dir.nr; i++) {
 		struct dir_entry *ent = dir.entries[i];
-		if (index_name_is_other(istate, ent->name, ent->len) &&
-		    dir_path_match(istate, ent, &s->pathspec, 0, NULL))
+		if (index_name_is_other(istate, ent->name, ent->len))
 			string_list_insert(&s->untracked, ent->name);
 		free(ent);
 	}
 
 	for (i = 0; i < dir.ignored_nr; i++) {
 		struct dir_entry *ent = dir.ignored[i];
-		if (index_name_is_other(istate, ent->name, ent->len) &&
-		    dir_path_match(istate, ent, &s->pathspec, 0, NULL))
+		if (index_name_is_other(istate, ent->name, ent->len))
 			string_list_insert(&s->ignored, ent->name);
 		free(ent);
 	}
@@ -1434,6 +1432,8 @@ static void show_cherry_pick_in_progress(struct wt_status *s,
 			status_printf_ln(s, color,
 				_("  (all conflicts fixed: run \"git cherry-pick --continue\")"));
 		status_printf_ln(s, color,
+			_("  (use \"git cherry-pick --skip\" to skip this patch)"));
+		status_printf_ln(s, color,
 			_("  (use \"git cherry-pick --abort\" to cancel the cherry-pick operation)"));
 	}
 	wt_longstatus_print_trailer(s);
@@ -1461,6 +1461,8 @@ static void show_revert_in_progress(struct wt_status *s,
 			status_printf_ln(s, color,
 				_("  (all conflicts fixed: run \"git revert --continue\")"));
 		status_printf_ln(s, color,
+			_("  (use \"git revert --skip\" to skip this patch)"));
+		status_printf_ln(s, color,
 			_("  (use \"git revert --abort\" to cancel the revert operation)"));
 	}
 	wt_longstatus_print_trailer(s);
@@ -1479,6 +1481,18 @@ static void show_bisect_in_progress(struct wt_status *s,
 	if (s->hints)
 		status_printf_ln(s, color,
 			_("  (use \"git bisect reset\" to get back to the original branch)"));
+	wt_longstatus_print_trailer(s);
+}
+
+static void show_sparse_checkout_in_use(struct wt_status *s,
+					const char *color)
+{
+	if (s->state.sparse_checkout_percentage == SPARSE_CHECKOUT_DISABLED)
+		return;
+
+	status_printf_ln(s, color,
+			 _("You are in a sparse checkout with %d%% of tracked files present."),
+			 s->state.sparse_checkout_percentage);
 	wt_longstatus_print_trailer(s);
 }
 
@@ -1621,6 +1635,31 @@ int wt_status_check_bisect(const struct worktree *wt,
 	return 0;
 }
 
+static void wt_status_check_sparse_checkout(struct repository *r,
+					    struct wt_status_state *state)
+{
+	int skip_worktree = 0;
+	int i;
+
+	if (!core_apply_sparse_checkout || r->index->cache_nr == 0) {
+		/*
+		 * Don't compute percentage of checked out files if we
+		 * aren't in a sparse checkout or would get division by 0.
+		 */
+		state->sparse_checkout_percentage = SPARSE_CHECKOUT_DISABLED;
+		return;
+	}
+
+	for (i = 0; i < r->index->cache_nr; i++) {
+		struct cache_entry *ce = r->index->cache[i];
+		if (ce_skip_worktree(ce))
+			skip_worktree++;
+	}
+
+	state->sparse_checkout_percentage =
+		100 - (100 * skip_worktree)/r->index->cache_nr;
+}
+
 void wt_status_get_state(struct repository *r,
 			 struct wt_status_state *state,
 			 int get_detached_from)
@@ -1656,6 +1695,7 @@ void wt_status_get_state(struct repository *r,
 	}
 	if (get_detached_from)
 		wt_status_get_detached_from(r, state);
+	wt_status_check_sparse_checkout(r, state);
 }
 
 static void wt_longstatus_print_state(struct wt_status *s)
@@ -1679,6 +1719,9 @@ static void wt_longstatus_print_state(struct wt_status *s)
 		show_revert_in_progress(s, state_color);
 	if (state->bisect_in_progress)
 		show_bisect_in_progress(s, state_color);
+
+	if (state->sparse_checkout_percentage != SPARSE_CHECKOUT_DISABLED)
+		show_sparse_checkout_in_use(s, state_color);
 }
 
 static void wt_longstatus_print(struct wt_status *s)
@@ -2025,7 +2068,7 @@ static void wt_porcelain_v2_print_tracking(struct wt_status *s)
 	char eol = s->null_termination ? '\0' : '\n';
 
 	fprintf(s->fp, "# branch.oid %s%c",
-			(s->is_initial ? "(initial)" : sha1_to_hex(s->sha1_commit)),
+			(s->is_initial ? "(initial)" : oid_to_hex(&s->oid_commit)),
 			eol);
 
 	if (!s->branch)

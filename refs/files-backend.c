@@ -465,8 +465,7 @@ stat_ref:
 	close(fd);
 	strbuf_rtrim(&sb_contents);
 	buf = sb_contents.buf;
-	if (starts_with(buf, "ref:")) {
-		buf += 4;
+	if (skip_prefix(buf, "ref:", &buf)) {
 		while (isspace(*buf))
 			buf++;
 
@@ -1327,7 +1326,7 @@ static int files_copy_or_rename_ref(struct ref_store *ref_store,
 {
 	struct files_ref_store *refs =
 		files_downcast(ref_store, REF_STORE_WRITE, "rename_ref");
-	struct object_id oid, orig_oid;
+	struct object_id orig_oid;
 	int flag = 0, logmoved = 0;
 	struct ref_lock *lock;
 	struct stat loginfo;
@@ -1395,7 +1394,7 @@ static int files_copy_or_rename_ref(struct ref_store *ref_store,
 	 */
 	if (!copy && !refs_read_ref_full(&refs->base, newrefname,
 				RESOLVE_REF_READING | RESOLVE_REF_NO_RECURSE,
-				&oid, NULL) &&
+				NULL, NULL) &&
 	    refs_delete_ref(&refs->base, NULL, newrefname,
 			    NULL, REF_NO_DEREF)) {
 		if (errno == EISDIR) {
@@ -2566,16 +2565,18 @@ static void files_transaction_cleanup(struct files_ref_store *refs,
 		}
 	}
 
-	if (backend_data->packed_transaction &&
-	    ref_transaction_abort(backend_data->packed_transaction, &err)) {
-		error("error aborting transaction: %s", err.buf);
-		strbuf_release(&err);
+	if (backend_data) {
+		if (backend_data->packed_transaction &&
+		    ref_transaction_abort(backend_data->packed_transaction, &err)) {
+			error("error aborting transaction: %s", err.buf);
+			strbuf_release(&err);
+		}
+
+		if (backend_data->packed_refs_locked)
+			packed_refs_unlock(refs->packed_ref_store);
+
+		free(backend_data);
 	}
-
-	if (backend_data->packed_refs_locked)
-		packed_refs_unlock(refs->packed_ref_store);
-
-	free(backend_data);
 
 	transaction->state = REF_TRANSACTION_CLOSED;
 }

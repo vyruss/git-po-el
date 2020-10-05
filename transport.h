@@ -5,8 +5,7 @@
 #include "run-command.h"
 #include "remote.h"
 #include "list-objects-filter-options.h"
-
-struct string_list;
+#include "string-list.h"
 
 struct git_transport_options {
 	unsigned thin : 1;
@@ -98,7 +97,8 @@ struct transport {
 	 */
 	const struct string_list *server_options;
 
-	char *pack_lockfile;
+	struct string_list pack_lockfiles;
+
 	signed verbose : 3;
 	/**
 	 * Transports should not set this directly, and should use this
@@ -115,6 +115,8 @@ struct transport {
 	struct git_transport_options *smart_options;
 
 	enum transport_family family;
+
+	const struct git_hash_algo *hash_algo;
 };
 
 #define TRANSPORT_PUSH_ALL			(1<<0)
@@ -208,6 +210,9 @@ void transport_check_allowed(const char *type);
 /* Filter objects for partial clone and fetch */
 #define TRANS_OPT_LIST_OBJECTS_FILTER "filter"
 
+/* Request atomic (all-or-nothing) updates when pushing */
+#define TRANS_OPT_ATOMIC "atomic"
+
 /**
  * Returns 0 if the option was used, non-zero otherwise. Prints a
  * message to stderr if the option is not used.
@@ -240,6 +245,12 @@ int transport_push(struct repository *repo,
 const struct ref *transport_get_remote_refs(struct transport *transport,
 					    const struct argv_array *ref_prefixes);
 
+/*
+ * Fetch the hash algorithm used by a remote.
+ *
+ * This can only be called after fetching the remote refs.
+ */
+const struct git_hash_algo *transport_get_hash_algo(struct transport *transport);
 int transport_fetch_refs(struct transport *transport, struct ref *refs);
 void transport_unlock_pack(struct transport *transport);
 int transport_disconnect(struct transport *transport);
@@ -261,5 +272,8 @@ int transport_refs_pushed(struct ref *ref);
 
 void transport_print_push_status(const char *dest, struct ref *refs,
 		  int verbose, int porcelain, unsigned int *reject_reasons);
+
+/* common method used by transport-helper.c and send-pack.c */
+void reject_atomic_push(struct ref *refs, int mirror_mode);
 
 #endif

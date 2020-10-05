@@ -5,6 +5,7 @@
 #include "connected.h"
 #include "transport.h"
 #include "packfile.h"
+#include "promisor-remote.h"
 
 /*
  * If we feed all the commits we want to verify to this command
@@ -28,6 +29,7 @@ int check_connected(oid_iterate_fn fn, void *cb_data,
 	struct packed_git *new_pack = NULL;
 	struct transport *transport;
 	size_t base_len;
+	const unsigned hexsz = the_hash_algo->hexsz;
 
 	if (!opt)
 		opt = &defaults;
@@ -41,31 +43,52 @@ int check_connected(oid_iterate_fn fn, void *cb_data,
 
 	if (transport && transport->smart_options &&
 	    transport->smart_options->self_contained_and_connected &&
-	    transport->pack_lockfile &&
-	    strip_suffix(transport->pack_lockfile, ".keep", &base_len)) {
+	    transport->pack_lockfiles.nr == 1 &&
+	    strip_suffix(transport->pack_lockfiles.items[0].string,
+			 ".keep", &base_len)) {
 		struct strbuf idx_file = STRBUF_INIT;
-		strbuf_add(&idx_file, transport->pack_lockfile, base_len);
+		strbuf_add(&idx_file, transport->pack_lockfiles.items[0].string,
+			   base_len);
 		strbuf_addstr(&idx_file, ".idx");
 		new_pack = add_packed_git(idx_file.buf, idx_file.len, 1);
 		strbuf_release(&idx_file);
 	}
 
-	if (opt->check_refs_only) {
+	if (has_promisor_remote()) {
 		/*
 		 * For partial clones, we don't want to have to do a regular
 		 * connectivity check because we have to enumerate and exclude
 		 * all promisor objects (slow), and then the connectivity check
 		 * itself becomes a no-op because in a partial clone every
 		 * object is a promisor object. Instead, just make sure we
-		 * received the objects pointed to by each wanted ref.
+		 * received, in a promisor packfile, the objects pointed to by
+		 * each wanted ref.
+		 *
+		 * Before checking for promisor packs, be sure we have the
+		 * latest pack-files loaded into memory.
 		 */
+		reprepare_packed_git(the_repository);
 		do {
-			if (!repo_has_object_file(the_repository, &oid))
-				return 1;
+			struct packed_git *p;
+
+			for (p = get_all_packs(the_repository); p; p = p->next) {
+				if (!p->pack_promisor)
+					continue;
+				if (find_pack_entry_one(oid.hash, p))
+					goto promisor_pack_found;
+			}
+			/*
+			 * Fallback to rev-list with oid and the rest of the
+			 * object IDs provided by fn.
+			 */
+			goto no_promisor_pack_found;
+promisor_pack_found:
+			;
 		} while (!fn(cb_data, &oid));
 		return 0;
 	}
 
+no_promisor_pack_found:
 	if (opt->shallow_file) {
 		argv_array_push(&rev_list.args, "--shallow-file");
 		argv_array_push(&rev_list.args, opt->shallow_file);
@@ -73,7 +96,7 @@ int check_connected(oid_iterate_fn fn, void *cb_data,
 	argv_array_push(&rev_list.args,"rev-list");
 	argv_array_push(&rev_list.args, "--objects");
 	argv_array_push(&rev_list.args, "--stdin");
-	if (repository_format_partial_clone)
+	if (has_promisor_remote())
 		argv_array_push(&rev_list.args, "--exclude-promisor-objects");
 	if (!opt->is_deepening_fetch) {
 		argv_array_push(&rev_list.args, "--not");
@@ -99,7 +122,7 @@ int check_connected(oid_iterate_fn fn, void *cb_data,
 
 	sigchain_push(SIGPIPE, SIG_IGN);
 
-	commit[GIT_SHA1_HEXSZ] = '\n';
+	commit[hexsz] = '\n';
 	do {
 		/*
 		 * If index-pack already checked that:
@@ -112,8 +135,8 @@ int check_connected(oid_iterate_fn fn, void *cb_data,
 		if (new_pack && find_pack_entry_one(oid.hash, new_pack))
 			continue;
 
-		memcpy(commit, oid_to_hex(&oid), GIT_SHA1_HEXSZ);
-		if (write_in_full(rev_list.in, commit, GIT_SHA1_HEXSZ + 1) < 0) {
+		memcpy(commit, oid_to_hex(&oid), hexsz);
+		if (write_in_full(rev_list.in, commit, hexsz + 1) < 0) {
 			if (errno != EPIPE && errno != EINVAL)
 				error_errno(_("failed write to rev-list"));
 			err = -1;

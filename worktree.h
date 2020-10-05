@@ -18,19 +18,14 @@ struct worktree {
 	int lock_reason_valid; /* private */
 };
 
-/* Functions for acting on the information about worktrees. */
-
-#define GWT_SORT_LINKED (1 << 0) /* keeps linked worktrees sorted */
-
 /*
  * Get the worktrees.  The primary worktree will always be the first returned,
- * and linked worktrees will be pointed to by 'next' in each subsequent
- * worktree.  No specific ordering is done on the linked worktrees.
+ * and linked worktrees will follow in no particular order.
  *
  * The caller is responsible for freeing the memory from the returned
- * worktree(s).
+ * worktrees by calling free_worktrees().
  */
-struct worktree **get_worktrees(unsigned flags);
+struct worktree **get_worktrees(void);
 
 /*
  * Returns 1 if linked worktrees exist, 0 otherwise.
@@ -44,12 +39,28 @@ int submodule_uses_worktrees(const char *path);
 const char *get_worktree_git_dir(const struct worktree *wt);
 
 /*
- * Search a worktree that can be unambiguously identified by
- * "arg". "prefix" must not be NULL.
+ * Search for the worktree identified unambiguously by `arg` -- typically
+ * supplied by the user via the command-line -- which may be a pathname or some
+ * shorthand uniquely identifying a worktree, thus making it convenient for the
+ * user to specify a worktree with minimal typing. For instance, if the last
+ * component (say, "foo") of a worktree's pathname is unique among worktrees
+ * (say, "work/foo" and "work/bar"), it can be used to identify the worktree
+ * unambiguously.
+ *
+ * `prefix` should be the `prefix` handed to top-level Git commands along with
+ * `argc` and `argv`.
+ *
+ * Return the worktree identified by `arg`, or NULL if not found.
  */
 struct worktree *find_worktree(struct worktree **list,
 			       const char *prefix,
 			       const char *arg);
+
+/*
+ * Return the worktree corresponding to `path`, or NULL if no such worktree
+ * exists.
+ */
+struct worktree *find_worktree_by_path(struct worktree **, const char *path);
 
 /*
  * Return true if the given worktree is the main one.

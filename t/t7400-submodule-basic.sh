@@ -55,6 +55,21 @@ test_expect_success 'add aborts on repository with no commits' '
 	test_i18ncmp expect actual
 '
 
+test_expect_success 'status should ignore inner git repo when not added' '
+	rm -fr inner &&
+	mkdir inner &&
+	(
+		cd inner &&
+		git init &&
+		>t &&
+		git add t &&
+		git commit -m "initial"
+	) &&
+	test_must_fail git submodule status inner 2>output.err &&
+	rm -fr inner &&
+	test_i18ngrep "^error: .*did not match any file(s) known to git" output.err
+'
+
 test_expect_success 'setup - repository in init subdirectory' '
 	mkdir init &&
 	(
@@ -156,9 +171,11 @@ test_expect_success 'submodule add to .gitignored path fails' '
 	(
 		cd addtest-ignore &&
 		cat <<-\EOF >expect &&
-		The following path is ignored by one of your .gitignore files:
+		The following paths are ignored by one of your .gitignore files:
 		submod
-		Use -f if you really want to add it.
+		hint: Use -f if you really want to add them.
+		hint: Turn this message off by running
+		hint: "git config advice.addIgnoredFile false"
 		EOF
 		# Does not use test_commit due to the ignore
 		echo "*" > .gitignore &&
@@ -188,6 +205,17 @@ test_expect_success 'submodule add to reconfigure existing submodule with --forc
 		git submodule add --force "$submodurl" submod &&
 		test "$submodurl" = "$(git config -f .gitmodules submodule.submod.url)" &&
 		test "$submodurl" = "$(git config submodule.submod.url)"
+	)
+'
+
+test_expect_success 'submodule add relays add --dry-run stderr' '
+	test_when_finished "rm -rf addtest/.git/index.lock" &&
+	(
+		cd addtest &&
+		: >.git/index.lock &&
+		! git submodule add "$submodurl" sub-while-locked 2>output.err &&
+		test_i18ngrep "^fatal: .*index\.lock" output.err &&
+		test_path_is_missing sub-while-locked
 	)
 '
 
@@ -356,6 +384,28 @@ test_expect_success 'status should only print one line' '
 	test_line_count = 1 lines
 '
 
+test_expect_success 'status from subdirectory should have the same SHA1' '
+	test_when_finished "rmdir addtest/subdir" &&
+	(
+		cd addtest &&
+		mkdir subdir &&
+		git submodule status >output &&
+		awk "{print \$1}" <output >expect &&
+		cd subdir &&
+		git submodule status >../output &&
+		awk "{print \$1}" <../output >../actual &&
+		test_cmp ../expect ../actual &&
+		git -C ../submod checkout HEAD^ &&
+		git submodule status >../output &&
+		awk "{print \$1}" <../output >../actual2 &&
+		cd .. &&
+		git submodule status >output &&
+		awk "{print \$1}" <output >expect2 &&
+		test_cmp expect2 actual2 &&
+		! test_cmp actual actual2
+	)
+'
+
 test_expect_success 'setup - fetch commit name from submodule' '
 	rev1=$(cd .subrepo && git rev-parse HEAD) &&
 	printf "rev1: %s\n" "$rev1" &&
@@ -375,6 +425,14 @@ test_expect_success 'init should register submodule url in .git/config' '
 	git config submodule.example.url ./.subrepo &&
 
 	test_cmp expect url
+'
+
+test_expect_success 'status should still be "missing" after initializing' '
+	rm -fr init &&
+	mkdir init &&
+	git submodule status >lines &&
+	rm -fr init &&
+	grep "^-$rev1" lines
 '
 
 test_failure_with_unknown_submodule () {
@@ -527,7 +585,6 @@ test_expect_success 'update --init' '
 	test_must_fail git config submodule.example.url &&
 
 	git submodule update init 2> update.out &&
-	cat update.out &&
 	test_i18ngrep "not initialized" update.out &&
 	test_must_fail git rev-parse --resolve-git-dir init/.git &&
 
@@ -545,7 +602,6 @@ test_expect_success 'update --init from subdirectory' '
 	(
 		cd sub &&
 		git submodule update ../init 2>update.out &&
-		cat update.out &&
 		test_i18ngrep "not initialized" update.out &&
 		test_must_fail git rev-parse --resolve-git-dir ../init/.git &&
 
@@ -882,7 +938,7 @@ test_expect_success 'submodule add --name allows to replace a submodule with ano
 		echo "repo" >expect &&
 		test_must_fail git config -f .gitmodules submodule.repo.path &&
 		git config -f .gitmodules submodule.repo_new.path >actual &&
-		test_cmp expect actual&&
+		test_cmp expect actual &&
 		echo "$submodurl/repo" >expect &&
 		test_must_fail git config -f .gitmodules submodule.repo.url &&
 		echo "$submodurl/bare.git" >expect &&
@@ -954,7 +1010,7 @@ test_expect_success 'submodule add with an existing name fails unless forced' '
 		test -d repo &&
 		echo "repo" >expect &&
 		git config -f .gitmodules submodule.repo_new.path >actual &&
-		test_cmp expect actual&&
+		test_cmp expect actual &&
 		echo "$submodurl/repo.git" >expect &&
 		git config -f .gitmodules submodule.repo_new.url >actual &&
 		test_cmp expect actual &&

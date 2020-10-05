@@ -79,17 +79,20 @@ static struct expand_data {
 } oi, oi_deref;
 
 struct ref_to_worktree_entry {
-	struct hashmap_entry ent; /* must be the first member! */
+	struct hashmap_entry ent;
 	struct worktree *wt; /* key is wt->head_ref */
 };
 
 static int ref_to_worktree_map_cmpfnc(const void *unused_lookupdata,
-				      const void *existing_hashmap_entry_to_test,
-				      const void *key,
+				      const struct hashmap_entry *eptr,
+				      const struct hashmap_entry *kptr,
 				      const void *keydata_aka_refname)
 {
-	const struct ref_to_worktree_entry *e = existing_hashmap_entry_to_test;
-	const struct ref_to_worktree_entry *k = key;
+	const struct ref_to_worktree_entry *e, *k;
+
+	e = container_of(eptr, const struct ref_to_worktree_entry, ent);
+	k = container_of(kptr, const struct ref_to_worktree_entry, ent);
+
 	return strcmp(e->wt->head_ref,
 		keydata_aka_refname ? keydata_aka_refname : k->wt->head_ref);
 }
@@ -276,9 +279,9 @@ static int deltabase_atom_parser(const struct ref_format *format, struct used_at
 	if (arg)
 		return strbuf_addf_ret(err, -1, _("%%(deltabase) does not take arguments"));
 	if (*atom->name == '*')
-		oi_deref.info.delta_base_sha1 = oi_deref.delta_base_oid.hash;
+		oi_deref.info.delta_base_oid = &oi_deref.delta_base_oid;
 	else
-		oi.info.delta_base_sha1 = oi.delta_base_oid.hash;
+		oi.info.delta_base_oid = &oi.delta_base_oid;
 	return 0;
 }
 
@@ -1028,7 +1031,7 @@ static const char *copy_name(const char *buf)
 		if (!strncmp(cp, " <", 2))
 			return xmemdupz(buf, cp - buf);
 	}
-	return "";
+	return xstrdup("");
 }
 
 static const char *copy_email(const char *buf)
@@ -1036,10 +1039,10 @@ static const char *copy_email(const char *buf)
 	const char *email = strchr(buf, '<');
 	const char *eoemail;
 	if (!email)
-		return "";
+		return xstrdup("");
 	eoemail = strchr(email, '>');
 	if (!eoemail)
-		return "";
+		return xstrdup("");
 	return xmemdupz(email, eoemail + 1 - email);
 }
 
@@ -1456,12 +1459,10 @@ static void fill_remote_ref_details(struct used_atom *atom, const char *refname,
 			remote_for_branch(branch, &explicit);
 		*s = xstrdup(explicit ? remote : "");
 	} else if (atom->u.remote_ref.option == RR_REMOTE_REF) {
-		int explicit;
 		const char *merge;
 
-		merge = remote_ref_for_branch(branch, atom->u.remote_ref.push,
-					      &explicit);
-		*s = xstrdup(explicit ? merge : "");
+		merge = remote_ref_for_branch(branch, atom->u.remote_ref.push);
+		*s = xstrdup(merge ? merge : "");
 	} else
 		BUG("unhandled RR_* enum");
 }
@@ -1565,9 +1566,10 @@ static void populate_worktree_map(struct hashmap *map, struct worktree **worktre
 			struct ref_to_worktree_entry *entry;
 			entry = xmalloc(sizeof(*entry));
 			entry->wt = worktrees[i];
-			hashmap_entry_init(entry, strhash(worktrees[i]->head_ref));
+			hashmap_entry_init(&entry->ent,
+					strhash(worktrees[i]->head_ref));
 
-			hashmap_add(map, entry);
+			hashmap_add(map, &entry->ent);
 		}
 	}
 }
@@ -1577,25 +1579,27 @@ static void lazy_init_worktree_map(void)
 	if (ref_to_worktree_map.worktrees)
 		return;
 
-	ref_to_worktree_map.worktrees = get_worktrees(0);
+	ref_to_worktree_map.worktrees = get_worktrees();
 	hashmap_init(&(ref_to_worktree_map.map), ref_to_worktree_map_cmpfnc, NULL, 0);
 	populate_worktree_map(&(ref_to_worktree_map.map), ref_to_worktree_map.worktrees);
 }
 
 static char *get_worktree_path(const struct used_atom *atom, const struct ref_array_item *ref)
 {
-	struct hashmap_entry entry;
+	struct hashmap_entry entry, *e;
 	struct ref_to_worktree_entry *lookup_result;
 
 	lazy_init_worktree_map();
 
 	hashmap_entry_init(&entry, strhash(ref->refname));
-	lookup_result = hashmap_get(&(ref_to_worktree_map.map), &entry, ref->refname);
+	e = hashmap_get(&(ref_to_worktree_map.map), &entry, ref->refname);
 
-	if (lookup_result)
-		return xstrdup(lookup_result->wt->path);
-	else
+	if (!e)
 		return xstrdup("");
+
+	lookup_result = container_of(e, struct ref_to_worktree_entry, ent);
+
+	return xstrdup(lookup_result->wt->path);
 }
 
 /*
@@ -1766,7 +1770,7 @@ static int populate_value(struct ref_array_item *ref, struct strbuf *err)
 	 * If it is a tag object, see if we use a value that derefs
 	 * the object, and if we do grab the object it refers to.
 	 */
-	oi_deref.oid = ((struct tag *)obj)->tagged->oid;
+	oi_deref.oid = *get_tagged_oid((struct tag *)obj);
 
 	/*
 	 * NEEDSWORK: This derefs tag only once, which
@@ -1972,10 +1976,9 @@ static int for_each_fullref_in_pattern(struct ref_filter *filter,
 }
 
 /*
- * Given a ref (sha1, refname), check if the ref belongs to the array
- * of sha1s. If the given ref is a tag, check if the given tag points
- * at one of the sha1s in the given sha1 array.
- * the given sha1_array.
+ * Given a ref (oid, refname), check if the ref belongs to the array
+ * of oids. If the given ref is a tag, check if the given tag points
+ * at one of the oids in the given oid array.
  * NEEDSWORK:
  * 1. Only a single level of inderection is obtained, we might want to
  * change this to account for multiple levels (e.g. annotated tags
@@ -1997,7 +2000,7 @@ static const struct object_id *match_points_at(struct oid_array *points_at,
 	if (!obj)
 		die(_("malformed object at '%s'"), refname);
 	if (obj->type == OBJ_TAG)
-		tagged_oid = &((struct tag *)obj)->tagged->oid;
+		tagged_oid = get_tagged_oid((struct tag *)obj);
 	if (tagged_oid && oid_array_lookup(points_at, tagged_oid) >= 0)
 		return tagged_oid;
 	return NULL;
@@ -2166,7 +2169,8 @@ void ref_array_clear(struct ref_array *array)
 	used_atom_cnt = 0;
 
 	if (ref_to_worktree_map.worktrees) {
-		hashmap_free(&(ref_to_worktree_map.map), 1);
+		hashmap_free_entries(&(ref_to_worktree_map.map),
+					struct ref_to_worktree_entry, ent);
 		free_worktrees(ref_to_worktree_map.worktrees);
 		ref_to_worktree_map.worktrees = NULL;
 	}
@@ -2291,7 +2295,7 @@ static int cmp_ref_sorting(struct ref_sorting *s, struct ref_array_item *a, stru
 		if (va->value < vb->value)
 			cmp = -1;
 		else if (va->value == vb->value)
-			cmp = cmp_fn(a->refname, b->refname);
+			cmp = 0;
 		else
 			cmp = 1;
 	}
@@ -2310,7 +2314,16 @@ static int compare_refs(const void *a_, const void *b_, void *ref_sorting)
 		if (cmp)
 			return cmp;
 	}
-	return 0;
+	s = ref_sorting;
+	return s && s->ignore_case ?
+		strcasecmp(a->refname, b->refname) :
+		strcmp(a->refname, b->refname);
+}
+
+void ref_sorting_icase_all(struct ref_sorting *sorting, int flag)
+{
+	for (; sorting; sorting = sorting->next)
+		sorting->ignore_case = !!flag;
 }
 
 void ref_array_sort(struct ref_sorting *sorting, struct ref_array *array)

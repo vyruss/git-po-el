@@ -61,7 +61,7 @@ static enum parse_opt_result opt_command_mode_error(
 	 */
 	for (that = all_opts; that->type != OPTION_END; that++) {
 		if (that == opt ||
-		    that->type != OPTION_CMDMODE ||
+		    !(that->flags & PARSE_OPT_CMDMODE) ||
 		    that->value != opt->value ||
 		    that->defval != *(int *)opt->value)
 			continue;
@@ -94,6 +94,14 @@ static enum parse_opt_result get_value(struct parse_opt_ctx_t *p,
 		return error(_("%s isn't available"), optname(opt, flags));
 	if (!(flags & OPT_SHORT) && p->opt && (opt->flags & PARSE_OPT_NOARG))
 		return error(_("%s takes no value"), optname(opt, flags));
+
+	/*
+	 * Giving the same mode option twice, although unnecessary,
+	 * is not a grave error, so let it pass.
+	 */
+	if ((opt->flags & PARSE_OPT_CMDMODE) &&
+	    *(int *)opt->value && *(int *)opt->value != opt->defval)
+		return opt_command_mode_error(opt, all_opts, flags);
 
 	switch (opt->type) {
 	case OPTION_LOWLEVEL_CALLBACK:
@@ -128,16 +136,6 @@ static enum parse_opt_result get_value(struct parse_opt_ctx_t *p,
 
 	case OPTION_SET_INT:
 		*(int *)opt->value = unset ? 0 : opt->defval;
-		return 0;
-
-	case OPTION_CMDMODE:
-		/*
-		 * Giving the same mode option twice, although is unnecessary,
-		 * is not a grave error, so let it pass.
-		 */
-		if (*(int *)opt->value && *(int *)opt->value != opt->defval)
-			return opt_command_mode_error(opt, all_opts, flags);
-		*(int *)opt->value = opt->defval;
 		return 0;
 
 	case OPTION_STRING:
@@ -357,8 +355,7 @@ is_abbreviated:
 			}
 			/* negated? */
 			if (!starts_with(arg, "no-")) {
-				if (starts_with(long_name, "no-")) {
-					long_name += 3;
+				if (skip_prefix(long_name, "no-", &long_name)) {
 					opt_flags |= OPT_UNSET;
 					goto again;
 				}
@@ -420,7 +417,7 @@ static void check_typos(const char *arg, const struct option *options)
 		return;
 
 	if (starts_with(arg, "no-")) {
-		error(_("did you mean `--%s` (with two dashes ?)"), arg);
+		error(_("did you mean `--%s` (with two dashes)?"), arg);
 		exit(129);
 	}
 
@@ -428,7 +425,7 @@ static void check_typos(const char *arg, const struct option *options)
 		if (!options->long_name)
 			continue;
 		if (starts_with(options->long_name, arg)) {
-			error(_("did you mean `--%s` (with two dashes ?)"), arg);
+			error(_("did you mean `--%s` (with two dashes)?"), arg);
 			exit(129);
 		}
 	}
@@ -623,7 +620,7 @@ static int show_gitcomp(const struct option *opts)
  * Scan and may produce a new option[] array, which should be used
  * instead of the original 'options'.
  *
- * Right now this is only used to preprocess and substitue
+ * Right now this is only used to preprocess and substitute
  * OPTION_ALIAS.
  */
 static struct option *preprocess_options(struct parse_opt_ctx_t *ctx,
@@ -651,6 +648,7 @@ static struct option *preprocess_options(struct parse_opt_ctx_t *ctx,
 		int short_name;
 		const char *long_name;
 		const char *source;
+		struct strbuf help = STRBUF_INIT;
 		int j;
 
 		if (newopt[i].type != OPTION_ALIAS)
@@ -662,6 +660,7 @@ static struct option *preprocess_options(struct parse_opt_ctx_t *ctx,
 
 		if (!long_name)
 			BUG("An alias must have long option name");
+		strbuf_addf(&help, _("alias of --%s"), source);
 
 		for (j = 0; j < nr; j++) {
 			const char *name = options[j].long_name;
@@ -672,15 +671,10 @@ static struct option *preprocess_options(struct parse_opt_ctx_t *ctx,
 			if (options[j].type == OPTION_ALIAS)
 				BUG("No please. Nested aliases are not supported.");
 
-			/*
-			 * NEEDSWORK: this is a bit inconsistent because
-			 * usage_with_options() on the original options[] will print
-			 * help string as "alias of %s" but "git cmd -h" will
-			 * print the original help string.
-			 */
 			memcpy(newopt + i, options + j, sizeof(*newopt));
 			newopt[i].short_name = short_name;
 			newopt[i].long_name = long_name;
+			newopt[i].help = strbuf_detach(&help, NULL);
 			break;
 		}
 
@@ -780,7 +774,8 @@ int parse_options_step(struct parse_opt_ctx_t *ctx,
 			continue;
 		}
 
-		if (!arg[2]) { /* "--" */
+		if (!arg[2] /* "--" */ ||
+		    !strcmp(arg + 2, "end-of-options")) {
 			if (!(ctx->flags & PARSE_OPT_KEEP_DASHDASH)) {
 				ctx->argc--;
 				ctx->argv++;

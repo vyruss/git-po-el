@@ -345,7 +345,16 @@ test_incompatible_with_recurse_submodules ()
 }
 
 test_incompatible_with_recurse_submodules --untracked
-test_incompatible_with_recurse_submodules --no-index
+
+test_expect_success 'grep --recurse-submodules --no-index ignores --recurse-submodules' '
+	git grep --recurse-submodules --no-index -e "^(.|.)[\d]" >actual &&
+	cat >expect <<-\EOF &&
+	a:(1|2)d(3|4)
+	submodule/a:(1|2)d(3|4)
+	submodule/sub/a:(1|2)d(3|4)
+	EOF
+	test_cmp expect actual
+'
 
 test_expect_success 'grep --recurse-submodules should pass the pattern type along' '
 	# Fixed
@@ -408,4 +417,25 @@ test_expect_success 'grep --recurse-submodules with submodules without .gitmodul
 	test_cmp expect actual
 '
 
+reset_and_clean () {
+	git reset --hard &&
+	git clean -fd &&
+	git submodule foreach --recursive 'git reset --hard' &&
+	git submodule foreach --recursive 'git clean -fd'
+}
+
+test_expect_success 'grep --recurse-submodules without --cached considers worktree modifications' '
+	reset_and_clean &&
+	echo "A modified line in submodule" >>submodule/a &&
+	echo "submodule/a:A modified line in submodule" >expect &&
+	git grep --recurse-submodules "A modified line in submodule" >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'grep --recurse-submodules with --cached ignores worktree modifications' '
+	reset_and_clean &&
+	echo "A modified line in submodule" >>submodule/a &&
+	test_must_fail git grep --recurse-submodules --cached "A modified line in submodule" >actual 2>&1 &&
+	test_must_be_empty actual
+'
 test_done

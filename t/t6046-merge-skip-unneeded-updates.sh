@@ -36,10 +36,10 @@ test_description="merge cases"
 #   Commit B: b_3
 #   Expected: b_2
 
-test_expect_success '1a-setup: Modify(A)/Modify(B), change on B subset of A' '
-	test_create_repo 1a &&
+test_setup_1a () {
+	test_create_repo 1a_$1 &&
 	(
-		cd 1a &&
+		cd 1a_$1 &&
 
 		test_write_lines 1 2 3 4 5 6 7 8 9 10 >b &&
 		git add b &&
@@ -62,26 +62,24 @@ test_expect_success '1a-setup: Modify(A)/Modify(B), change on B subset of A' '
 		test_tick &&
 		git commit -m "B"
 	)
-'
+}
 
-test_expect_success '1a-check-L: Modify(A)/Modify(B), change on B subset of A' '
-	test_when_finished "git -C 1a reset --hard" &&
-	test_when_finished "git -C 1a clean -fd" &&
+test_expect_success '1a-L: Modify(A)/Modify(B), change on B subset of A' '
+	test_setup_1a L &&
 	(
-		cd 1a &&
+		cd 1a_L &&
 
 		git checkout A^0 &&
 
-		test-tool chmtime =31337 b &&
-		test-tool chmtime -v +0 b >expected-mtime &&
+		test-tool chmtime --get -3600 b >old-mtime &&
 
 		GIT_MERGE_VERBOSITY=3 git merge -s recursive B^0 >out 2>err &&
 
-		test_i18ngrep "Skipped b" out &&
 		test_must_be_empty err &&
 
-		test-tool chmtime -v +0 b >actual-mtime &&
-		test_cmp expected-mtime actual-mtime &&
+		# Make sure b was NOT updated
+		test-tool chmtime --get b >new-mtime &&
+		test_cmp old-mtime new-mtime &&
 
 		git ls-files -s >index_files &&
 		test_line_count = 1 index_files &&
@@ -96,17 +94,20 @@ test_expect_success '1a-check-L: Modify(A)/Modify(B), change on B subset of A' '
 	)
 '
 
-test_expect_success '1a-check-R: Modify(A)/Modify(B), change on B subset of A' '
-	test_when_finished "git -C 1a reset --hard" &&
-	test_when_finished "git -C 1a clean -fd" &&
+test_expect_success '1a-R: Modify(A)/Modify(B), change on B subset of A' '
+	test_setup_1a R &&
 	(
-		cd 1a &&
+		cd 1a_R &&
 
 		git checkout B^0 &&
 
+		test-tool chmtime --get -3600 b >old-mtime &&
 		GIT_MERGE_VERBOSITY=3 git merge -s recursive A^0 >out 2>err &&
 
-		test_i18ngrep "Auto-merging b" out &&
+		# Make sure b WAS updated
+		test-tool chmtime --get b >new-mtime &&
+		test $(cat old-mtime) -lt $(cat new-mtime) &&
+
 		test_must_be_empty err &&
 
 		git ls-files -s >index_files &&
@@ -133,10 +134,10 @@ test_expect_success '1a-check-R: Modify(A)/Modify(B), change on B subset of A' '
 #   Commit B: c_1
 #   Expected: c_2
 
-test_expect_success '2a-setup: Modify(A)/rename(B)' '
-	test_create_repo 2a &&
+test_setup_2a () {
+	test_create_repo 2a_$1 &&
 	(
-		cd 2a &&
+		cd 2a_$1 &&
 
 		test_seq 1 10 >b &&
 		git add b &&
@@ -158,20 +159,19 @@ test_expect_success '2a-setup: Modify(A)/rename(B)' '
 		test_tick &&
 		git commit -m "B"
 	)
-'
+}
 
-test_expect_success '2a-check-L: Modify/rename, merge into modify side' '
-	test_when_finished "git -C 2a reset --hard" &&
-	test_when_finished "git -C 2a clean -fd" &&
+test_expect_success '2a-L: Modify/rename, merge into modify side' '
+	test_setup_2a L &&
 	(
-		cd 2a &&
+		cd 2a_L &&
 
 		git checkout A^0 &&
 
+		test_path_is_missing c &&
 		GIT_MERGE_VERBOSITY=3 git merge -s recursive B^0 >out 2>err &&
 
-		test_i18ngrep ! "Skipped c" out &&
-		test_must_be_empty err &&
+		test_path_is_file c &&
 
 		git ls-files -s >index_files &&
 		test_line_count = 1 index_files &&
@@ -189,17 +189,20 @@ test_expect_success '2a-check-L: Modify/rename, merge into modify side' '
 	)
 '
 
-test_expect_success '2a-check-R: Modify/rename, merge into rename side' '
-	test_when_finished "git -C 2a reset --hard" &&
-	test_when_finished "git -C 2a clean -fd" &&
+test_expect_success '2a-R: Modify/rename, merge into rename side' '
+	test_setup_2a R &&
 	(
-		cd 2a &&
+		cd 2a_R &&
 
 		git checkout B^0 &&
 
+		test-tool chmtime --get -3600 c >old-mtime &&
 		GIT_MERGE_VERBOSITY=3 git merge -s recursive A^0 >out 2>err &&
 
-		test_i18ngrep ! "Skipped c" out &&
+		# Make sure c WAS updated
+		test-tool chmtime --get c >new-mtime &&
+		test $(cat old-mtime) -lt $(cat new-mtime) &&
+
 		test_must_be_empty err &&
 
 		git ls-files -s >index_files &&
@@ -224,10 +227,10 @@ test_expect_success '2a-check-R: Modify/rename, merge into rename side' '
 #   Commit B: b_3
 #   Expected: c_2
 
-test_expect_success '2b-setup: Rename+Mod(A)/Mod(B), B mods subset of A' '
-	test_create_repo 2b &&
+test_setup_2b () {
+	test_create_repo 2b_$1 &&
 	(
-		cd 2b &&
+		cd 2b_$1 &&
 
 		test_write_lines 1 2 3 4 5 6 7 8 9 10 >b &&
 		git add b &&
@@ -251,26 +254,23 @@ test_expect_success '2b-setup: Rename+Mod(A)/Mod(B), B mods subset of A' '
 		test_tick &&
 		git commit -m "B"
 	)
-'
+}
 
-test_expect_success '2b-check-L: Rename+Mod(A)/Mod(B), B mods subset of A' '
-	test_when_finished "git -C 2b reset --hard" &&
-	test_when_finished "git -C 2b clean -fd" &&
+test_expect_success '2b-L: Rename+Mod(A)/Mod(B), B mods subset of A' '
+	test_setup_2b L &&
 	(
-		cd 2b &&
+		cd 2b_L &&
 
 		git checkout A^0 &&
 
-		test-tool chmtime =31337 c &&
-		test-tool chmtime -v +0 c >expected-mtime &&
-
+		test-tool chmtime --get -3600 c >old-mtime &&
 		GIT_MERGE_VERBOSITY=3 git merge -s recursive B^0 >out 2>err &&
 
-		test_i18ngrep "Skipped c" out &&
 		test_must_be_empty err &&
 
-		test-tool chmtime -v +0 c >actual-mtime &&
-		test_cmp expected-mtime actual-mtime &&
+		# Make sure c WAS updated
+		test-tool chmtime --get c >new-mtime &&
+		test_cmp old-mtime new-mtime &&
 
 		git ls-files -s >index_files &&
 		test_line_count = 1 index_files &&
@@ -288,17 +288,19 @@ test_expect_success '2b-check-L: Rename+Mod(A)/Mod(B), B mods subset of A' '
 	)
 '
 
-test_expect_success '2b-check-R: Rename+Mod(A)/Mod(B), B mods subset of A' '
-	test_when_finished "git -C 2b reset --hard" &&
-	test_when_finished "git -C 2b clean -fd" &&
+test_expect_success '2b-R: Rename+Mod(A)/Mod(B), B mods subset of A' '
+	test_setup_2b R &&
 	(
-		cd 2b &&
+		cd 2b_R &&
 
 		git checkout B^0 &&
 
+		test_path_is_missing c &&
 		GIT_MERGE_VERBOSITY=3 git merge -s recursive A^0 >out 2>err &&
 
-		test_i18ngrep "Auto-merging c" out &&
+		# Make sure c now present (and thus was updated)
+		test_path_is_file c &&
+
 		test_must_be_empty err &&
 
 		git ls-files -s >index_files &&
@@ -332,7 +334,7 @@ test_expect_success '2b-check-R: Rename+Mod(A)/Mod(B), B mods subset of A' '
 #         skip the update, then we're in trouble.  This test verifies we do
 #         not make that particular mistake.
 
-test_expect_success '2c-setup: Modify b & add c VS rename b->c' '
+test_setup_2c () {
 	test_create_repo 2c &&
 	(
 		cd 2c &&
@@ -358,21 +360,26 @@ test_expect_success '2c-setup: Modify b & add c VS rename b->c' '
 		test_tick &&
 		git commit -m "B"
 	)
-'
+}
 
-test_expect_success '2c-check: Modify b & add c VS rename b->c' '
+test_expect_success '2c: Modify b & add c VS rename b->c' '
+	test_setup_2c &&
 	(
 		cd 2c &&
 
 		git checkout A^0 &&
 
+		test-tool chmtime --get -3600 c >old-mtime &&
 		GIT_MERGE_VERBOSITY=3 &&
 		export GIT_MERGE_VERBOSITY &&
 		test_must_fail git merge -s recursive B^0 >out 2>err &&
 
 		test_i18ngrep "CONFLICT (rename/add): Rename b->c" out &&
-		test_i18ngrep ! "Skipped c" out &&
-		test_must_be_empty err
+		test_must_be_empty err &&
+
+		# Make sure c WAS updated
+		test-tool chmtime --get c >new-mtime &&
+		test $(cat old-mtime) -lt $(cat new-mtime)
 
 		# FIXME: rename/add conflicts are horribly broken right now;
 		# when I get back to my patch series fixing it and
@@ -428,10 +435,10 @@ test_expect_success '2c-check: Modify b & add c VS rename b->c' '
 #   Commit B: bq_1, bar/whatever
 #   Expected: bar/{bq_2, whatever}
 
-test_expect_success '3a-setup: bq_1->foo/bq_2 on A, foo/->bar/ on B' '
-	test_create_repo 3a &&
+test_setup_3a () {
+	test_create_repo 3a_$1 &&
 	(
-		cd 3a &&
+		cd 3a_$1 &&
 
 		mkdir foo &&
 		test_seq 1 10 >bq &&
@@ -456,20 +463,21 @@ test_expect_success '3a-setup: bq_1->foo/bq_2 on A, foo/->bar/ on B' '
 		test_tick &&
 		git commit -m "B"
 	)
-'
+}
 
-test_expect_success '3a-check-L: bq_1->foo/bq_2 on A, foo/->bar/ on B' '
-	test_when_finished "git -C 3a reset --hard" &&
-	test_when_finished "git -C 3a clean -fd" &&
+test_expect_success '3a-L: bq_1->foo/bq_2 on A, foo/->bar/ on B' '
+	test_setup_3a L &&
 	(
-		cd 3a &&
+		cd 3a_L &&
 
 		git checkout A^0 &&
 
+		test_path_is_missing bar/bq &&
 		GIT_MERGE_VERBOSITY=3 git -c merge.directoryRenames=true merge -s recursive B^0 >out 2>err &&
 
-		test_i18ngrep ! "Skipped bar/bq" out &&
 		test_must_be_empty err &&
+
+		test_path_is_file bar/bq &&
 
 		git ls-files -s >index_files &&
 		test_line_count = 2 index_files &&
@@ -487,18 +495,19 @@ test_expect_success '3a-check-L: bq_1->foo/bq_2 on A, foo/->bar/ on B' '
 	)
 '
 
-test_expect_success '3a-check-R: bq_1->foo/bq_2 on A, foo/->bar/ on B' '
-	test_when_finished "git -C 3a reset --hard" &&
-	test_when_finished "git -C 3a clean -fd" &&
+test_expect_success '3a-R: bq_1->foo/bq_2 on A, foo/->bar/ on B' '
+	test_setup_3a R &&
 	(
-		cd 3a &&
+		cd 3a_R &&
 
 		git checkout B^0 &&
 
+		test_path_is_missing bar/bq &&
 		GIT_MERGE_VERBOSITY=3 git -c merge.directoryRenames=true merge -s recursive A^0 >out 2>err &&
 
-		test_i18ngrep ! "Skipped bar/bq" out &&
 		test_must_be_empty err &&
+
+		test_path_is_file bar/bq &&
 
 		git ls-files -s >index_files &&
 		test_line_count = 2 index_files &&
@@ -522,10 +531,10 @@ test_expect_success '3a-check-R: bq_1->foo/bq_2 on A, foo/->bar/ on B' '
 #   Commit B: bq_2, bar/whatever
 #   Expected: bar/{bq_2, whatever}
 
-test_expect_success '3b-setup: bq_1->foo/bq_2 on A, foo/->bar/ on B' '
-	test_create_repo 3b &&
+test_setup_3b () {
+	test_create_repo 3b_$1 &&
 	(
-		cd 3b &&
+		cd 3b_$1 &&
 
 		mkdir foo &&
 		test_seq 1 10 >bq &&
@@ -550,20 +559,21 @@ test_expect_success '3b-setup: bq_1->foo/bq_2 on A, foo/->bar/ on B' '
 		test_tick &&
 		git commit -m "B"
 	)
-'
+}
 
-test_expect_success '3b-check-L: bq_1->foo/bq_2 on A, foo/->bar/ on B' '
-	test_when_finished "git -C 3b reset --hard" &&
-	test_when_finished "git -C 3b clean -fd" &&
+test_expect_success '3b-L: bq_1->foo/bq_2 on A, foo/->bar/ on B' '
+	test_setup_3b L &&
 	(
-		cd 3b &&
+		cd 3b_L &&
 
 		git checkout A^0 &&
 
+		test_path_is_missing bar/bq &&
 		GIT_MERGE_VERBOSITY=3 git -c merge.directoryRenames=true merge -s recursive B^0 >out 2>err &&
 
-		test_i18ngrep ! "Skipped bar/bq" out &&
 		test_must_be_empty err &&
+
+		test_path_is_file bar/bq &&
 
 		git ls-files -s >index_files &&
 		test_line_count = 2 index_files &&
@@ -581,18 +591,19 @@ test_expect_success '3b-check-L: bq_1->foo/bq_2 on A, foo/->bar/ on B' '
 	)
 '
 
-test_expect_success '3b-check-R: bq_1->foo/bq_2 on A, foo/->bar/ on B' '
-	test_when_finished "git -C 3b reset --hard" &&
-	test_when_finished "git -C 3b clean -fd" &&
+test_expect_success '3b-R: bq_1->foo/bq_2 on A, foo/->bar/ on B' '
+	test_setup_3b R &&
 	(
-		cd 3b &&
+		cd 3b_R &&
 
 		git checkout B^0 &&
 
+		test_path_is_missing bar/bq &&
 		GIT_MERGE_VERBOSITY=3 git -c merge.directoryRenames=true merge -s recursive A^0 >out 2>err &&
 
-		test_i18ngrep ! "Skipped bar/bq" out &&
 		test_must_be_empty err &&
+
+		test_path_is_file bar/bq &&
 
 		git ls-files -s >index_files &&
 		test_line_count = 2 index_files &&
@@ -621,7 +632,7 @@ test_expect_success '3b-check-R: bq_1->foo/bq_2 on A, foo/->bar/ on B' '
 #   Working copy: b_4
 #   Expected: b_2 for merge, b_4 in working copy
 
-test_expect_success '4a-setup: Change on A, change on B subset of A, dirty mods present' '
+test_setup_4a () {
 	test_create_repo 4a &&
 	(
 		cd 4a &&
@@ -647,7 +658,7 @@ test_expect_success '4a-setup: Change on A, change on B subset of A, dirty mods 
 		test_tick &&
 		git commit -m "B"
 	)
-'
+}
 
 # NOTE: For as long as we continue using unpack_trees() without index_only
 #   set to true, it will error out on a case like this claiming the the locally
@@ -655,25 +666,23 @@ test_expect_success '4a-setup: Change on A, change on B subset of A, dirty mods 
 #   correct requires doing the merge in-memory first, then realizing that no
 #   updates to the file are necessary, and thus that we can just leave the path
 #   alone.
-test_expect_failure '4a-check: Change on A, change on B subset of A, dirty mods present' '
-	test_when_finished "git -C 4a reset --hard" &&
-	test_when_finished "git -C 4a clean -fd" &&
+test_expect_failure '4a: Change on A, change on B subset of A, dirty mods present' '
+	test_setup_4a &&
 	(
 		cd 4a &&
 
 		git checkout A^0 &&
 		echo "File rewritten" >b &&
 
-		test-tool chmtime =31337 b &&
-		test-tool chmtime -v +0 b >expected-mtime &&
+		test-tool chmtime --get -3600 b >old-mtime &&
 
 		GIT_MERGE_VERBOSITY=3 git merge -s recursive B^0 >out 2>err &&
 
-		test_i18ngrep "Skipped b" out &&
 		test_must_be_empty err &&
 
-		test-tool chmtime -v +0 b >actual-mtime &&
-		test_cmp expected-mtime actual-mtime &&
+		# Make sure b was NOT updated
+		test-tool chmtime --get b >new-mtime &&
+		test_cmp old-mtime new-mtime &&
 
 		git ls-files -s >index_files &&
 		test_line_count = 1 index_files &&
@@ -695,7 +704,7 @@ test_expect_failure '4a-check: Change on A, change on B subset of A, dirty mods 
 #   Working copy: c_4
 #   Expected: c_2
 
-test_expect_success '4b-setup: Rename+Mod(A)/Mod(B), change on B subset of A, dirty mods present' '
+test_setup_4b () {
 	test_create_repo 4b &&
 	(
 		cd 4b &&
@@ -722,27 +731,25 @@ test_expect_success '4b-setup: Rename+Mod(A)/Mod(B), change on B subset of A, di
 		test_tick &&
 		git commit -m "B"
 	)
-'
+}
 
-test_expect_success '4b-check: Rename+Mod(A)/Mod(B), change on B subset of A, dirty mods present' '
-	test_when_finished "git -C 4b reset --hard" &&
-	test_when_finished "git -C 4b clean -fd" &&
+test_expect_success '4b: Rename+Mod(A)/Mod(B), change on B subset of A, dirty mods present' '
+	test_setup_4b &&
 	(
 		cd 4b &&
 
 		git checkout A^0 &&
 		echo "File rewritten" >c &&
 
-		test-tool chmtime =31337 c &&
-		test-tool chmtime -v +0 c >expected-mtime &&
+		test-tool chmtime --get -3600 c >old-mtime &&
 
 		GIT_MERGE_VERBOSITY=3 git merge -s recursive B^0 >out 2>err &&
 
-		test_i18ngrep "Skipped c" out &&
 		test_must_be_empty err &&
 
-		test-tool chmtime -v +0 c >actual-mtime &&
-		test_cmp expected-mtime actual-mtime &&
+		# Make sure c was NOT updated
+		test-tool chmtime --get c >new-mtime &&
+		test_cmp old-mtime new-mtime &&
 
 		git ls-files -s >index_files &&
 		test_line_count = 1 index_files &&

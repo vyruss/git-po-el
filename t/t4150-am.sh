@@ -166,7 +166,7 @@ test_expect_success setup '
 	test_tick &&
 	git commit -m third &&
 
-	git format-patch --stdout first >patch2	&&
+	git format-patch --stdout first >patch2 &&
 
 	git checkout -b lorem &&
 	sed -n -e "11,\$p" msg >file &&
@@ -666,6 +666,26 @@ test_expect_success 'am --show-current-patch' '
 	test_cmp .git/rebase-apply/0001 actual.patch
 '
 
+test_expect_success 'am --show-current-patch=raw' '
+	git am --show-current-patch=raw >actual.patch &&
+	test_cmp .git/rebase-apply/0001 actual.patch
+'
+
+test_expect_success 'am --show-current-patch=diff' '
+	git am --show-current-patch=diff >actual.patch &&
+	test_cmp .git/rebase-apply/patch actual.patch
+'
+
+test_expect_success 'am accepts repeated --show-current-patch' '
+	git am --show-current-patch --show-current-patch=raw >actual.patch &&
+	test_cmp .git/rebase-apply/0001 actual.patch
+'
+
+test_expect_success 'am detects incompatible --show-current-patch' '
+	test_must_fail git am --show-current-patch=raw --show-current-patch=diff &&
+	test_must_fail git am --show-current-patch --show-current-patch=diff
+'
+
 test_expect_success 'am --skip works' '
 	echo goodbye >expected &&
 	git am --skip &&
@@ -1059,6 +1079,58 @@ test_expect_success 'am --quit keeps HEAD where it is' '
 	test_path_is_missing .git/rebase-apply &&
 	git rev-parse HEAD >actual &&
 	test_cmp expected actual
+'
+
+test_expect_success 'am and .gitattibutes' '
+	test_create_repo attributes &&
+	(
+		cd attributes &&
+		test_commit init &&
+		git config filter.test.clean "sed -e '\''s/smudged/clean/g'\''" &&
+		git config filter.test.smudge "sed -e '\''s/clean/smudged/g'\''" &&
+
+		test_commit second &&
+		git checkout -b test HEAD^ &&
+
+		echo "*.txt filter=test conflict-marker-size=10" >.gitattributes &&
+		git add .gitattributes &&
+		test_commit third &&
+
+		echo "This text is smudged." >a.txt &&
+		git add a.txt &&
+		test_commit fourth &&
+
+		git checkout -b removal HEAD^ &&
+		git rm .gitattributes &&
+		git add -u &&
+		test_commit fifth &&
+		git cherry-pick test &&
+
+		git checkout -b conflict third &&
+		echo "This text is different." >a.txt &&
+		git add a.txt &&
+		test_commit sixth &&
+
+		git checkout test &&
+		git format-patch --stdout master..HEAD >patches &&
+		git reset --hard master &&
+		git am patches &&
+		grep "smudged" a.txt &&
+
+		git checkout removal &&
+		git reset --hard &&
+		git format-patch --stdout master..HEAD >patches &&
+		git reset --hard master &&
+		git am patches &&
+		grep "clean" a.txt &&
+
+		git checkout conflict &&
+		git reset --hard &&
+		git format-patch --stdout master..HEAD >patches &&
+		git reset --hard fourth &&
+		test_must_fail git am -3 patches &&
+		grep "<<<<<<<<<<" a.txt
+	)
 '
 
 test_done

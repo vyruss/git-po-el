@@ -24,7 +24,6 @@
 #include "sequencer.h"
 #include "revision.h"
 #include "merge-recursive.h"
-#include "revision.h"
 #include "log-tree.h"
 #include "notes-utils.h"
 #include "rerere.h"
@@ -80,6 +79,11 @@ enum signoff_type {
 	SIGNOFF_FALSE = 0,
 	SIGNOFF_TRUE = 1,
 	SIGNOFF_EXPLICIT /* --signoff was set on the command-line */
+};
+
+enum show_patch_type {
+	SHOW_PATCH_RAW = 0,
+	SHOW_PATCH_DIFF = 1,
 };
 
 struct am_state {
@@ -1072,19 +1076,6 @@ static const char *msgnum(const struct am_state *state)
 }
 
 /**
- * Refresh and write index.
- */
-static void refresh_and_write_cache(void)
-{
-	struct lock_file lock_file = LOCK_INIT;
-
-	hold_locked_index(&lock_file, LOCK_DIE_ON_ERROR);
-	refresh_cache(REFRESH_QUIET);
-	if (write_locked_index(&the_index, &lock_file, COMMIT_LOCK))
-		die(_("unable to write index file"));
-}
-
-/**
  * Dies with a user-friendly message on how to proceed after resolving the
  * problem. This message can be overridden with state->resolvemsg.
  */
@@ -1272,7 +1263,9 @@ static void get_commit_info(struct am_state *state, struct commit *commit)
 	buffer = logmsg_reencode(commit, NULL, get_commit_output_encoding());
 
 	ident_line = find_commit_header(buffer, "author", &ident_len);
-
+	if (!ident_line)
+		die(_("missing author line in commit %s"),
+		      oid_to_hex(&commit->object.oid));
 	if (split_ident_line(&id, ident_line, ident_len) < 0)
 		die(_("invalid ident line: %.*s"), (int)ident_len, ident_line);
 
@@ -1538,7 +1531,7 @@ static int fall_back_threeway(const struct am_state *state, const char *index_pa
 	o.branch1 = "HEAD";
 	their_tree_name = xstrfmt("%.*s", linelen(state->msg), state->msg);
 	o.branch2 = their_tree_name;
-	o.detect_directory_renames = 0;
+	o.detect_directory_renames = MERGE_DIRECTORY_RENAMES_NONE;
 
 	if (state->quiet)
 		o.verbosity = 0;
@@ -1698,12 +1691,12 @@ static int do_interactive(struct am_state *state)
  */
 static void am_run(struct am_state *state, int resume)
 {
-	const char *argv_gc_auto[] = {"gc", "--auto", NULL};
 	struct strbuf sb = STRBUF_INIT;
 
 	unlink(am_path(state, "dirtyindex"));
 
-	refresh_and_write_cache();
+	if (refresh_and_write_cache(REFRESH_QUIET, 0, 0) < 0)
+		die(_("unable to write index file"));
 
 	if (repo_index_has_changes(the_repository, NULL, &sb)) {
 		write_state_bool(state, "dirtyindex", 1);
@@ -1774,7 +1767,7 @@ static void am_run(struct am_state *state, int resume)
 				linelen(state->msg), state->msg);
 
 			if (advice_amworkdir)
-				advise(_("Use 'git am --show-current-patch' to see the failed patch"));
+				advise(_("Use 'git am --show-current-patch=diff' to see the failed patch"));
 
 			die_user_resolve(state);
 		}
@@ -1802,7 +1795,7 @@ next:
 	if (!state->rebasing) {
 		am_destroy(state);
 		close_object_store(the_repository->objects);
-		run_command_v_opt(argv_gc_auto, RUN_GIT_CMD);
+		run_auto_gc(state->quiet);
 	}
 }
 
@@ -2072,7 +2065,7 @@ static void am_abort(struct am_state *state)
 	am_destroy(state);
 }
 
-static int show_patch(struct am_state *state)
+static int show_patch(struct am_state *state, enum show_patch_type sub_mode)
 {
 	struct strbuf sb = STRBUF_INIT;
 	const char *patch_path;
@@ -2089,7 +2082,17 @@ static int show_patch(struct am_state *state)
 		return ret;
 	}
 
-	patch_path = am_path(state, msgnum(state));
+	switch (sub_mode) {
+	case SHOW_PATCH_RAW:
+		patch_path = am_path(state, msgnum(state));
+		break;
+	case SHOW_PATCH_DIFF:
+		patch_path = am_path(state, "patch");
+		break;
+	default:
+		BUG("invalid mode for --show-current-patch");
+	}
+
 	len = strbuf_read_file(&sb, patch_path, 0);
 	if (len < 0)
 		die_errno(_("failed to read '%s'"), patch_path);
@@ -2129,7 +2132,7 @@ static int parse_opt_patchformat(const struct option *opt, const char *arg, int 
 	return 0;
 }
 
-enum resume_mode {
+enum resume_type {
 	RESUME_FALSE = 0,
 	RESUME_APPLY,
 	RESUME_RESOLVED,
@@ -2138,6 +2141,45 @@ enum resume_mode {
 	RESUME_QUIT,
 	RESUME_SHOW_PATCH
 };
+
+struct resume_mode {
+	enum resume_type mode;
+	enum show_patch_type sub_mode;
+};
+
+static int parse_opt_show_current_patch(const struct option *opt, const char *arg, int unset)
+{
+	int *opt_value = opt->value;
+	struct resume_mode *resume = container_of(opt_value, struct resume_mode, mode);
+
+	/*
+	 * Please update $__git_showcurrentpatch in git-completion.bash
+	 * when you add new options
+	 */
+	const char *valid_modes[] = {
+		[SHOW_PATCH_DIFF] = "diff",
+		[SHOW_PATCH_RAW] = "raw"
+	};
+	int new_value = SHOW_PATCH_RAW;
+
+	if (arg) {
+		for (new_value = 0; new_value < ARRAY_SIZE(valid_modes); new_value++) {
+			if (!strcmp(arg, valid_modes[new_value]))
+				break;
+		}
+		if (new_value >= ARRAY_SIZE(valid_modes))
+			return error(_("Invalid value for --show-current-patch: %s"), arg);
+	}
+
+	if (resume->mode == RESUME_SHOW_PATCH && new_value != resume->sub_mode)
+		return error(_("--show-current-patch=%s is incompatible with "
+			       "--show-current-patch=%s"),
+			     arg, valid_modes[resume->sub_mode]);
+
+	resume->mode = RESUME_SHOW_PATCH;
+	resume->sub_mode = new_value;
+	return 0;
+}
 
 static int git_am_config(const char *k, const char *v, void *cb)
 {
@@ -2156,7 +2198,7 @@ int cmd_am(int argc, const char **argv, const char *prefix)
 	int binary = -1;
 	int keep_cr = -1;
 	int patch_format = PATCH_FORMAT_UNKNOWN;
-	enum resume_mode resume = RESUME_FALSE;
+	struct resume_mode resume = { .mode = RESUME_FALSE };
 	int in_progress;
 	int ret = 0;
 
@@ -2225,24 +2267,26 @@ int cmd_am(int argc, const char **argv, const char *prefix)
 			PARSE_OPT_NOARG),
 		OPT_STRING(0, "resolvemsg", &state.resolvemsg, NULL,
 			N_("override error message when patch failure occurs")),
-		OPT_CMDMODE(0, "continue", &resume,
+		OPT_CMDMODE(0, "continue", &resume.mode,
 			N_("continue applying patches after resolving a conflict"),
 			RESUME_RESOLVED),
-		OPT_CMDMODE('r', "resolved", &resume,
+		OPT_CMDMODE('r', "resolved", &resume.mode,
 			N_("synonyms for --continue"),
 			RESUME_RESOLVED),
-		OPT_CMDMODE(0, "skip", &resume,
+		OPT_CMDMODE(0, "skip", &resume.mode,
 			N_("skip the current patch"),
 			RESUME_SKIP),
-		OPT_CMDMODE(0, "abort", &resume,
+		OPT_CMDMODE(0, "abort", &resume.mode,
 			N_("restore the original branch and abort the patching operation."),
 			RESUME_ABORT),
-		OPT_CMDMODE(0, "quit", &resume,
+		OPT_CMDMODE(0, "quit", &resume.mode,
 			N_("abort the patching operation but keep HEAD where it is."),
 			RESUME_QUIT),
-		OPT_CMDMODE(0, "show-current-patch", &resume,
-			N_("show the patch being applied."),
-			RESUME_SHOW_PATCH),
+		{ OPTION_CALLBACK, 0, "show-current-patch", &resume.mode,
+		  "(diff|raw)",
+		  N_("show the patch being applied"),
+		  PARSE_OPT_CMDMODE | PARSE_OPT_OPTARG | PARSE_OPT_NONEG | PARSE_OPT_LITERAL_ARGHELP,
+		  parse_opt_show_current_patch, RESUME_SHOW_PATCH },
 		OPT_BOOL(0, "committer-date-is-author-date",
 			&state.committer_date_is_author_date,
 			N_("lie about committer date")),
@@ -2292,12 +2336,12 @@ int cmd_am(int argc, const char **argv, const char *prefix)
 		 *    intend to feed us a patch but wanted to continue
 		 *    unattended.
 		 */
-		if (argc || (resume == RESUME_FALSE && !isatty(0)))
+		if (argc || (resume.mode == RESUME_FALSE && !isatty(0)))
 			die(_("previous rebase directory %s still exists but mbox given."),
 				state.dir);
 
-		if (resume == RESUME_FALSE)
-			resume = RESUME_APPLY;
+		if (resume.mode == RESUME_FALSE)
+			resume.mode = RESUME_APPLY;
 
 		if (state.signoff == SIGNOFF_EXPLICIT)
 			am_append_signoff(&state);
@@ -2311,7 +2355,7 @@ int cmd_am(int argc, const char **argv, const char *prefix)
 		 * stray directories.
 		 */
 		if (file_exists(state.dir) && !state.rebasing) {
-			if (resume == RESUME_ABORT || resume == RESUME_QUIT) {
+			if (resume.mode == RESUME_ABORT || resume.mode == RESUME_QUIT) {
 				am_destroy(&state);
 				am_state_release(&state);
 				return 0;
@@ -2322,7 +2366,7 @@ int cmd_am(int argc, const char **argv, const char *prefix)
 				state.dir);
 		}
 
-		if (resume)
+		if (resume.mode)
 			die(_("Resolve operation not in progress, we are not resuming."));
 
 		for (i = 0; i < argc; i++) {
@@ -2340,7 +2384,7 @@ int cmd_am(int argc, const char **argv, const char *prefix)
 		argv_array_clear(&paths);
 	}
 
-	switch (resume) {
+	switch (resume.mode) {
 	case RESUME_FALSE:
 		am_run(&state, 0);
 		break;
@@ -2361,7 +2405,7 @@ int cmd_am(int argc, const char **argv, const char *prefix)
 		am_destroy(&state);
 		break;
 	case RESUME_SHOW_PATCH:
-		ret = show_patch(&state);
+		ret = show_patch(&state, resume.sub_mode);
 		break;
 	default:
 		BUG("invalid resume value");

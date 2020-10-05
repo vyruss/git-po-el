@@ -18,6 +18,7 @@
 #include "object-store.h"
 #include "mem-pool.h"
 #include "commit-reach.h"
+#include "khash.h"
 
 #define PACK_ID_BITS 16
 #define MAX_PACK_ID ((1<<PACK_ID_BITS)-1)
@@ -38,11 +39,27 @@
 
 struct object_entry {
 	struct pack_idx_entry idx;
-	struct object_entry *next;
+	struct hashmap_entry ent;
 	uint32_t type : TYPE_BITS,
 		pack_id : PACK_ID_BITS,
 		depth : DEPTH_BITS;
 };
+
+static int object_entry_hashcmp(const void *map_data,
+				const struct hashmap_entry *eptr,
+				const struct hashmap_entry *entry_or_key,
+				const void *keydata)
+{
+	const struct object_id *oid = keydata;
+	const struct object_entry *e1, *e2;
+
+	e1 = container_of(eptr, const struct object_entry, ent);
+	if (oid)
+		return oidcmp(&e1->idx.oid, oid);
+
+	e2 = container_of(entry_or_key, const struct object_entry, ent);
+	return oidcmp(&e1->idx.oid, &e2->idx.oid);
+}
 
 struct object_entry_pool {
 	struct object_entry_pool *next_pool;
@@ -53,6 +70,7 @@ struct object_entry_pool {
 
 struct mark_set {
 	union {
+		struct object_id *oids[1024];
 		struct object_entry *marked[1024];
 		struct mark_set *sets[1024];
 	} data;
@@ -121,6 +139,7 @@ struct hash_list {
 
 typedef enum {
 	WHENSPEC_RAW = 1,
+	WHENSPEC_RAW_PERMISSIVE,
 	WHENSPEC_RFC2822,
 	WHENSPEC_NOW
 } whenspec_type;
@@ -130,6 +149,9 @@ struct recent_command {
 	struct recent_command *next;
 	char *buf;
 };
+
+typedef void (*mark_set_inserter_t)(struct mark_set *s, struct object_id *oid, uintmax_t mark);
+typedef void (*each_mark_fn_t)(uintmax_t mark, void *obj, void *cbp);
 
 /* Configured limits on output */
 static unsigned long max_depth = 50;
@@ -173,7 +195,7 @@ static off_t pack_size;
 /* Table of objects we've written. */
 static unsigned int object_entry_alloc = 5000;
 static struct object_entry_pool *blocks;
-static struct object_entry *object_table[1 << 16];
+static struct hashmap object_table;
 static struct mark_set *marks;
 static const char *export_marks_file;
 static const char *import_marks_file;
@@ -217,9 +239,15 @@ static uintmax_t next_mark;
 static struct strbuf new_data = STRBUF_INIT;
 static int seen_data_command;
 static int require_explicit_termination;
+static int allow_unsafe_features;
 
 /* Signal handling */
 static volatile sig_atomic_t checkpoint_requested;
+
+/* Submodule marks */
+static struct string_list sub_marks_from = STRING_LIST_INIT_DUP;
+static struct string_list sub_marks_to = STRING_LIST_INIT_DUP;
+static kh_oid_map_t *sub_oid_map;
 
 /* Where to write output of cat-blob commands */
 static int cat_blob_fd = STDOUT_FILENO;
@@ -228,6 +256,29 @@ static void parse_argv(void);
 static void parse_get_mark(const char *p);
 static void parse_cat_blob(const char *p);
 static void parse_ls(const char *p, struct branch *b);
+
+static void for_each_mark(struct mark_set *m, uintmax_t base, each_mark_fn_t callback, void *p)
+{
+	uintmax_t k;
+	if (m->shift) {
+		for (k = 0; k < 1024; k++) {
+			if (m->data.sets[k])
+				for_each_mark(m->data.sets[k], base + (k << m->shift), callback, p);
+		}
+	} else {
+		for (k = 0; k < 1024; k++) {
+			if (m->data.marked[k])
+				callback(base + k, m->data.marked[k], p);
+		}
+	}
+}
+
+static void dump_marks_fn(uintmax_t mark, void *object, void *cbp) {
+	struct object_entry *e = object;
+	FILE *f = cbp;
+
+	fprintf(f, ":%" PRIuMAX " %s\n", mark, oid_to_hex(&e->idx.oid));
+}
 
 static void write_branch_report(FILE *rpt, struct branch *b)
 {
@@ -256,8 +307,6 @@ static void write_branch_report(FILE *rpt, struct branch *b)
 
 	fputc('\n', rpt);
 }
-
-static void dump_marks_helper(FILE *, uintmax_t, struct mark_set *);
 
 static void write_crash_report(const char *err)
 {
@@ -337,7 +386,7 @@ static void write_crash_report(const char *err)
 	if (export_marks_file)
 		fprintf(rpt, "  exported to %s\n", export_marks_file);
 	else
-		dump_marks_helper(rpt, 0, marks);
+		for_each_mark(marks, 0, dump_marks_fn, rpt);
 
 	fputc('\n', rpt);
 	fputs("-------------------\n", rpt);
@@ -423,44 +472,37 @@ static struct object_entry *new_object(struct object_id *oid)
 
 static struct object_entry *find_object(struct object_id *oid)
 {
-	unsigned int h = oid->hash[0] << 8 | oid->hash[1];
-	struct object_entry *e;
-	for (e = object_table[h]; e; e = e->next)
-		if (oideq(oid, &e->idx.oid))
-			return e;
-	return NULL;
+	return hashmap_get_entry_from_hash(&object_table, oidhash(oid), oid,
+					   struct object_entry, ent);
 }
 
 static struct object_entry *insert_object(struct object_id *oid)
 {
-	unsigned int h = oid->hash[0] << 8 | oid->hash[1];
-	struct object_entry *e = object_table[h];
+	struct object_entry *e;
+	unsigned int hash = oidhash(oid);
 
-	while (e) {
-		if (oideq(oid, &e->idx.oid))
-			return e;
-		e = e->next;
+	e = hashmap_get_entry_from_hash(&object_table, hash, oid,
+					struct object_entry, ent);
+	if (!e) {
+		e = new_object(oid);
+		e->idx.offset = 0;
+		hashmap_entry_init(&e->ent, hash);
+		hashmap_add(&object_table, &e->ent);
 	}
 
-	e = new_object(oid);
-	e->next = object_table[h];
-	e->idx.offset = 0;
-	object_table[h] = e;
 	return e;
 }
 
 static void invalidate_pack_id(unsigned int id)
 {
-	unsigned int h;
 	unsigned long lu;
 	struct tag *t;
+	struct hashmap_iter iter;
+	struct object_entry *e;
 
-	for (h = 0; h < ARRAY_SIZE(object_table); h++) {
-		struct object_entry *e;
-
-		for (e = object_table[h]; e; e = e->next)
-			if (e->pack_id == id)
-				e->pack_id = MAX_PACK_ID;
+	hashmap_for_each_entry(&object_table, &iter, e, ent) {
+		if (e->pack_id == id)
+			e->pack_id = MAX_PACK_ID;
 	}
 
 	for (lu = 0; lu < branch_table_sz; lu++) {
@@ -492,9 +534,8 @@ static char *pool_strdup(const char *s)
 	return r;
 }
 
-static void insert_mark(uintmax_t idnum, struct object_entry *oe)
+static void insert_mark(struct mark_set *s, uintmax_t idnum, struct object_entry *oe)
 {
-	struct mark_set *s = marks;
 	while ((idnum >> s->shift) >= 1024) {
 		s = mem_pool_calloc(&fi_mem_pool, 1, sizeof(struct mark_set));
 		s->shift = marks->shift + 10;
@@ -515,10 +556,9 @@ static void insert_mark(uintmax_t idnum, struct object_entry *oe)
 	s->data.marked[idnum] = oe;
 }
 
-static struct object_entry *find_mark(uintmax_t idnum)
+static void *find_mark(struct mark_set *s, uintmax_t idnum)
 {
 	uintmax_t orig_idnum = idnum;
-	struct mark_set *s = marks;
 	struct object_entry *oe = NULL;
 	if ((idnum >> s->shift) < 1024) {
 		while (s && s->shift) {
@@ -918,7 +958,7 @@ static int store_object(
 
 	e = insert_object(&oid);
 	if (mark)
-		insert_mark(mark, e);
+		insert_mark(marks, mark, e);
 	if (e->idx.offset) {
 		duplicate_count_by_type[type]++;
 		return 1;
@@ -1116,7 +1156,7 @@ static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 	e = insert_object(&oid);
 
 	if (mark)
-		insert_mark(mark, e);
+		insert_mark(marks, mark, e);
 
 	if (e->idx.offset) {
 		duplicate_count_by_type[OBJ_BLOB]++;
@@ -1654,26 +1694,6 @@ static void dump_tags(void)
 	strbuf_release(&err);
 }
 
-static void dump_marks_helper(FILE *f,
-	uintmax_t base,
-	struct mark_set *m)
-{
-	uintmax_t k;
-	if (m->shift) {
-		for (k = 0; k < 1024; k++) {
-			if (m->data.sets[k])
-				dump_marks_helper(f, base + (k << m->shift),
-					m->data.sets[k]);
-		}
-	} else {
-		for (k = 0; k < 1024; k++) {
-			if (m->data.marked[k])
-				fprintf(f, ":%" PRIuMAX " %s\n", base + k,
-					oid_to_hex(&m->data.marked[k]->idx.oid));
-		}
-	}
-}
-
 static void dump_marks(void)
 {
 	struct lock_file mark_lock = LOCK_INIT;
@@ -1681,6 +1701,12 @@ static void dump_marks(void)
 
 	if (!export_marks_file || (import_marks_file && !import_marks_file_done))
 		return;
+
+	if (safe_create_leading_directories_const(export_marks_file)) {
+		failure |= error_errno("unable to create leading directories of %s",
+				       export_marks_file);
+		return;
+	}
 
 	if (hold_lock_file_for_update(&mark_lock, export_marks_file, 0) < 0) {
 		failure |= error_errno("Unable to write marks file %s",
@@ -1697,7 +1723,7 @@ static void dump_marks(void)
 		return;
 	}
 
-	dump_marks_helper(f, 0, marks);
+	for_each_mark(marks, 0, dump_marks_fn, f);
 	if (commit_lock_file(&mark_lock)) {
 		failure |= error_errno("Unable to write file %s",
 				       export_marks_file);
@@ -1705,21 +1731,38 @@ static void dump_marks(void)
 	}
 }
 
-static void read_marks(void)
+static void insert_object_entry(struct mark_set *s, struct object_id *oid, uintmax_t mark)
+{
+	struct object_entry *e;
+	e = find_object(oid);
+	if (!e) {
+		enum object_type type = oid_object_info(the_repository,
+							oid, NULL);
+		if (type < 0)
+			die("object not found: %s", oid_to_hex(oid));
+		e = insert_object(oid);
+		e->type = type;
+		e->pack_id = MAX_PACK_ID;
+		e->idx.offset = 1; /* just not zero! */
+	}
+	insert_mark(s, mark, e);
+}
+
+static void insert_oid_entry(struct mark_set *s, struct object_id *oid, uintmax_t mark)
+{
+	insert_mark(s, mark, xmemdupz(oid, sizeof(*oid)));
+}
+
+static void read_mark_file(struct mark_set *s, FILE *f, mark_set_inserter_t inserter)
 {
 	char line[512];
-	FILE *f = fopen(import_marks_file, "r");
-	if (f)
-		;
-	else if (import_marks_file_ignore_missing && errno == ENOENT)
-		goto done; /* Marks file does not exist */
-	else
-		die_errno("cannot read '%s'", import_marks_file);
 	while (fgets(line, sizeof(line), f)) {
 		uintmax_t mark;
 		char *end;
 		struct object_id oid;
-		struct object_entry *e;
+
+		/* Ensure SHA-1 objects are padded with zeros. */
+		memset(oid.hash, 0, sizeof(oid.hash));
 
 		end = strchr(line, '\n');
 		if (line[0] != ':' || !end)
@@ -1727,21 +1770,23 @@ static void read_marks(void)
 		*end = 0;
 		mark = strtoumax(line + 1, &end, 10);
 		if (!mark || end == line + 1
-			|| *end != ' ' || get_oid_hex(end + 1, &oid))
+			|| *end != ' '
+			|| get_oid_hex_any(end + 1, &oid) == GIT_HASH_UNKNOWN)
 			die("corrupt mark line: %s", line);
-		e = find_object(&oid);
-		if (!e) {
-			enum object_type type = oid_object_info(the_repository,
-								&oid, NULL);
-			if (type < 0)
-				die("object not found: %s", oid_to_hex(&oid));
-			e = insert_object(&oid);
-			e->type = type;
-			e->pack_id = MAX_PACK_ID;
-			e->idx.offset = 1; /* just not zero! */
-		}
-		insert_mark(mark, e);
+		inserter(s, &oid, mark);
 	}
+}
+
+static void read_marks(void)
+{
+	FILE *f = fopen(import_marks_file, "r");
+	if (f)
+		;
+	else if (import_marks_file_ignore_missing && errno == ENOENT)
+		goto done; /* Marks file does not exist */
+	else
+		die_errno("cannot read '%s'", import_marks_file);
+	read_mark_file(marks, f, insert_object_entry);
 	fclose(f);
 done:
 	import_marks_file_done = 1;
@@ -1763,7 +1808,6 @@ static int read_next_command(void)
 		} else {
 			struct recent_command *rc;
 
-			strbuf_detach(&command_buf, NULL);
 			stdin_eof = strbuf_getline_lf(&command_buf, stdin);
 			if (stdin_eof)
 				return EOF;
@@ -1784,7 +1828,7 @@ static int read_next_command(void)
 				free(rc->buf);
 			}
 
-			rc->buf = command_buf.buf;
+			rc->buf = xstrdup(command_buf.buf);
 			rc->prev = cmd_tail;
 			rc->next = cmd_hist.prev;
 			rc->prev->next = rc;
@@ -1833,7 +1877,6 @@ static int parse_data(struct strbuf *sb, uintmax_t limit, uintmax_t *len_res)
 		char *term = xstrdup(data);
 		size_t term_len = command_buf.len - (data - command_buf.buf);
 
-		strbuf_detach(&command_buf, NULL);
 		for (;;) {
 			if (strbuf_getline_lf(&command_buf, stdin) == EOF)
 				die("EOF in data (terminator '%s' not found)", term);
@@ -1869,7 +1912,7 @@ static int parse_data(struct strbuf *sb, uintmax_t limit, uintmax_t *len_res)
 	return 1;
 }
 
-static int validate_raw_date(const char *src, struct strbuf *result)
+static int validate_raw_date(const char *src, struct strbuf *result, int strict)
 {
 	const char *orig_src = src;
 	char *endp;
@@ -1878,7 +1921,11 @@ static int validate_raw_date(const char *src, struct strbuf *result)
 	errno = 0;
 
 	num = strtoul(src, &endp, 10);
-	/* NEEDSWORK: perhaps check for reasonable values? */
+	/*
+	 * NEEDSWORK: perhaps check for reasonable values? For example, we
+	 *            could error on values representing times more than a
+	 *            day in the future.
+	 */
 	if (errno || endp == src || *endp != ' ')
 		return -1;
 
@@ -1887,7 +1934,13 @@ static int validate_raw_date(const char *src, struct strbuf *result)
 		return -1;
 
 	num = strtoul(src + 1, &endp, 10);
-	if (errno || endp == src + 1 || *endp || 1400 < num)
+	/*
+	 * NEEDSWORK: check for brokenness other than num > 1400, such as
+	 *            (num % 100) >= 60, or ((num % 100) % 15) != 0 ?
+	 */
+	if (errno || endp == src + 1 || *endp || /* did not parse */
+	    (strict && (1400 < num))             /* parsed a broken timezone */
+	   )
 		return -1;
 
 	strbuf_addstr(result, orig_src);
@@ -1921,7 +1974,11 @@ static char *parse_ident(const char *buf)
 
 	switch (whenspec) {
 	case WHENSPEC_RAW:
-		if (validate_raw_date(ltgt, &ident) < 0)
+		if (validate_raw_date(ltgt, &ident, 1) < 0)
+			die("Invalid raw date \"%s\" in ident: %s", ltgt, buf);
+		break;
+	case WHENSPEC_RAW_PERMISSIVE:
+		if (validate_raw_date(ltgt, &ident, 0) < 0)
 			die("Invalid raw date \"%s\" in ident: %s", ltgt, buf);
 		break;
 	case WHENSPEC_RFC2822:
@@ -2129,6 +2186,30 @@ static uintmax_t change_note_fanout(struct tree_entry *root,
 	return do_change_note_fanout(root, root, hex_oid, 0, path, 0, fanout);
 }
 
+static int parse_mapped_oid_hex(const char *hex, struct object_id *oid, const char **end)
+{
+	int algo;
+	khiter_t it;
+
+	/* Make SHA-1 object IDs have all-zero padding. */
+	memset(oid->hash, 0, sizeof(oid->hash));
+
+	algo = parse_oid_hex_any(hex, oid, end);
+	if (algo == GIT_HASH_UNKNOWN)
+		return -1;
+
+	it = kh_get_oid_map(sub_oid_map, *oid);
+	/* No such object? */
+	if (it == kh_end(sub_oid_map)) {
+		/* If we're using the same algorithm, pass it through. */
+		if (hash_algos[algo].format_id == the_hash_algo->format_id)
+			return 0;
+		return -1;
+	}
+	oidcpy(oid, kh_value(sub_oid_map, it));
+	return 0;
+}
+
 /*
  * Given a pointer into a string, parse a mark reference:
  *
@@ -2209,13 +2290,13 @@ static void file_change_m(const char *p, struct branch *b)
 	}
 
 	if (*p == ':') {
-		oe = find_mark(parse_mark_ref_space(&p));
+		oe = find_mark(marks, parse_mark_ref_space(&p));
 		oidcpy(&oid, &oe->idx.oid);
 	} else if (skip_prefix(p, "inline ", &p)) {
 		inline_data = 1;
 		oe = NULL; /* not used with inline_data, but makes gcc happy */
 	} else {
-		if (parse_oid_hex(p, &oid, &p))
+		if (parse_mapped_oid_hex(p, &oid, &p))
 			die("Invalid dataref: %s", command_buf.buf);
 		oe = find_object(&oid);
 		if (*p++ != ' ')
@@ -2383,13 +2464,13 @@ static void note_change_n(const char *p, struct branch *b, unsigned char *old_fa
 	/* Now parse the notemodify command. */
 	/* <dataref> or 'inline' */
 	if (*p == ':') {
-		oe = find_mark(parse_mark_ref_space(&p));
+		oe = find_mark(marks, parse_mark_ref_space(&p));
 		oidcpy(&oid, &oe->idx.oid);
 	} else if (skip_prefix(p, "inline ", &p)) {
 		inline_data = 1;
 		oe = NULL; /* not used with inline_data, but makes gcc happy */
 	} else {
-		if (parse_oid_hex(p, &oid, &p))
+		if (parse_mapped_oid_hex(p, &oid, &p))
 			die("Invalid dataref: %s", command_buf.buf);
 		oe = find_object(&oid);
 		if (*p++ != ' ')
@@ -2404,7 +2485,7 @@ static void note_change_n(const char *p, struct branch *b, unsigned char *old_fa
 		oidcpy(&commit_oid, &s->oid);
 	} else if (*p == ':') {
 		uintmax_t commit_mark = parse_mark_ref_eol(p);
-		struct object_entry *commit_oe = find_mark(commit_mark);
+		struct object_entry *commit_oe = find_mark(marks, commit_mark);
 		if (commit_oe->type != OBJ_COMMIT)
 			die("Mark :%" PRIuMAX " not a commit", commit_mark);
 		oidcpy(&commit_oid, &commit_oe->idx.oid);
@@ -2491,18 +2572,14 @@ static void parse_from_existing(struct branch *b)
 	}
 }
 
-static int parse_from(struct branch *b)
+static int parse_objectish(struct branch *b, const char *objectish)
 {
-	const char *from;
 	struct branch *s;
 	struct object_id oid;
 
-	if (!skip_prefix(command_buf.buf, "from ", &from))
-		return 0;
-
 	oidcpy(&oid, &b->branch_tree.versions[1].oid);
 
-	s = lookup_branch(from);
+	s = lookup_branch(objectish);
 	if (b == s)
 		die("Can't create a branch from itself: %s", b->name);
 	else if (s) {
@@ -2510,9 +2587,9 @@ static int parse_from(struct branch *b)
 		oidcpy(&b->oid, &s->oid);
 		oidcpy(&b->branch_tree.versions[0].oid, t);
 		oidcpy(&b->branch_tree.versions[1].oid, t);
-	} else if (*from == ':') {
-		uintmax_t idnum = parse_mark_ref_eol(from);
-		struct object_entry *oe = find_mark(idnum);
+	} else if (*objectish == ':') {
+		uintmax_t idnum = parse_mark_ref_eol(objectish);
+		struct object_entry *oe = find_mark(marks, idnum);
 		if (oe->type != OBJ_COMMIT)
 			die("Mark :%" PRIuMAX " not a commit", idnum);
 		if (!oideq(&b->oid, &oe->idx.oid)) {
@@ -2525,13 +2602,13 @@ static int parse_from(struct branch *b)
 			} else
 				parse_from_existing(b);
 		}
-	} else if (!get_oid(from, &b->oid)) {
+	} else if (!get_oid(objectish, &b->oid)) {
 		parse_from_existing(b);
 		if (is_null_oid(&b->oid))
 			b->delete = 1;
 	}
 	else
-		die("Invalid ref name or SHA1 expression: %s", from);
+		die("Invalid ref name or SHA1 expression: %s", objectish);
 
 	if (b->branch_tree.tree && !oideq(&oid, &b->branch_tree.versions[1].oid)) {
 		release_tree_content_recursive(b->branch_tree.tree);
@@ -2540,6 +2617,26 @@ static int parse_from(struct branch *b)
 
 	read_next_command();
 	return 1;
+}
+
+static int parse_from(struct branch *b)
+{
+	const char *from;
+
+	if (!skip_prefix(command_buf.buf, "from ", &from))
+		return 0;
+
+	return parse_objectish(b, from);
+}
+
+static int parse_objectish_with_prefix(struct branch *b, const char *prefix)
+{
+	const char *base;
+
+	if (!skip_prefix(command_buf.buf, prefix, &base))
+		return 0;
+
+	return parse_objectish(b, base);
 }
 
 static struct hash_list *parse_merge(unsigned int *count)
@@ -2556,7 +2653,7 @@ static struct hash_list *parse_merge(unsigned int *count)
 			oidcpy(&n->oid, &s->oid);
 		else if (*from == ':') {
 			uintmax_t idnum = parse_mark_ref_eol(from);
-			struct object_entry *oe = find_mark(idnum);
+			struct object_entry *oe = find_mark(marks, idnum);
 			if (oe->type != OBJ_COMMIT)
 				die("Mark :%" PRIuMAX " not a commit", idnum);
 			oidcpy(&n->oid, &oe->idx.oid);
@@ -2588,7 +2685,7 @@ static void parse_new_commit(const char *arg)
 	struct branch *b;
 	char *author = NULL;
 	char *committer = NULL;
-	const char *encoding = NULL;
+	char *encoding = NULL;
 	struct hash_list *merge_list = NULL;
 	unsigned int merge_count;
 	unsigned char prev_fanout, new_fanout;
@@ -2611,8 +2708,10 @@ static void parse_new_commit(const char *arg)
 	}
 	if (!committer)
 		die("Expected committer but didn't get one");
-	if (skip_prefix(command_buf.buf, "encoding ", &encoding))
+	if (skip_prefix(command_buf.buf, "encoding ", &v)) {
+		encoding = xstrdup(v);
 		read_next_command();
+	}
 	parse_data(&msg, 0, NULL);
 	read_next_command();
 	parse_from(b);
@@ -2686,6 +2785,7 @@ static void parse_new_commit(const char *arg)
 	strbuf_addbuf(&new_data, &msg);
 	free(author);
 	free(committer);
+	free(encoding);
 
 	if (!store_object(OBJ_COMMIT, &new_data, NULL, &b->oid, next_mark))
 		b->pack_id = pack_id;
@@ -2713,6 +2813,7 @@ static void parse_new_tag(const char *arg)
 		first_tag = t;
 	last_tag = t;
 	read_next_command();
+	parse_mark();
 
 	/* from ... */
 	if (!skip_prefix(command_buf.buf, "from ", &from))
@@ -2726,7 +2827,7 @@ static void parse_new_tag(const char *arg)
 	} else if (*from == ':') {
 		struct object_entry *oe;
 		from_mark = parse_mark_ref_eol(from);
-		oe = find_mark(from_mark);
+		oe = find_mark(marks, from_mark);
 		type = oe->type;
 		oidcpy(&oid, &oe->idx.oid);
 	} else if (!get_oid(from, &oid)) {
@@ -2769,7 +2870,7 @@ static void parse_new_tag(const char *arg)
 	strbuf_addbuf(&new_data, &msg);
 	free(tagger);
 
-	if (store_object(OBJ_TAG, &new_data, NULL, &t->oid, 0))
+	if (store_object(OBJ_TAG, &new_data, NULL, &t->oid, next_mark))
 		t->pack_id = MAX_PACK_ID;
 	else
 		t->pack_id = pack_id;
@@ -2778,6 +2879,7 @@ static void parse_new_tag(const char *arg)
 static void parse_reset_branch(const char *arg)
 {
 	struct branch *b;
+	const char *tag_name;
 
 	b = lookup_branch(arg);
 	if (b) {
@@ -2793,6 +2895,32 @@ static void parse_reset_branch(const char *arg)
 		b = new_branch(arg);
 	read_next_command();
 	parse_from(b);
+	if (b->delete && skip_prefix(b->name, "refs/tags/", &tag_name)) {
+		/*
+		 * Elsewhere, we call dump_branches() before dump_tags(),
+		 * and dump_branches() will handle ref deletions first, so
+		 * in order to make sure the deletion actually takes effect,
+		 * we need to remove the tag from our list of tags to update.
+		 *
+		 * NEEDSWORK: replace list of tags with hashmap for faster
+		 * deletion?
+		 */
+		struct tag *t, *prev = NULL;
+		for (t = first_tag; t; t = t->next_tag) {
+			if (!strcmp(t->name, tag_name))
+				break;
+			prev = t;
+		}
+		if (t) {
+			if (prev)
+				prev->next_tag = t->next_tag;
+			else
+				first_tag = t->next_tag;
+			if (!t->next_tag)
+				last_tag = prev;
+			/* There is no mem_pool_free(t) function to call. */
+		}
+	}
 	if (command_buf.len > 0)
 		unread_command_buf = 1;
 }
@@ -2857,7 +2985,7 @@ static void parse_get_mark(const char *p)
 	if (*p != ':')
 		die("Not a mark: %s", p);
 
-	oe = find_mark(parse_mark_ref_eol(p));
+	oe = find_mark(marks, parse_mark_ref_eol(p));
 	if (!oe)
 		die("Unknown mark: %s", command_buf.buf);
 
@@ -2872,12 +3000,12 @@ static void parse_cat_blob(const char *p)
 
 	/* cat-blob SP <object> LF */
 	if (*p == ':') {
-		oe = find_mark(parse_mark_ref_eol(p));
+		oe = find_mark(marks, parse_mark_ref_eol(p));
 		if (!oe)
 			die("Unknown mark: %s", command_buf.buf);
 		oidcpy(&oid, &oe->idx.oid);
 	} else {
-		if (parse_oid_hex(p, &oid, &p))
+		if (parse_mapped_oid_hex(p, &oid, &p))
 			die("Invalid dataref: %s", command_buf.buf);
 		if (*p)
 			die("Garbage after SHA1: %s", command_buf.buf);
@@ -2941,18 +3069,54 @@ static struct object_entry *dereference(struct object_entry *oe,
 	return find_object(oid);
 }
 
+static void insert_mapped_mark(uintmax_t mark, void *object, void *cbp)
+{
+	struct object_id *fromoid = object;
+	struct object_id *tooid = find_mark(cbp, mark);
+	int ret;
+	khiter_t it;
+
+	it = kh_put_oid_map(sub_oid_map, *fromoid, &ret);
+	/* We've already seen this object. */
+	if (ret == 0)
+		return;
+	kh_value(sub_oid_map, it) = tooid;
+}
+
+static void build_mark_map_one(struct mark_set *from, struct mark_set *to)
+{
+	for_each_mark(from, 0, insert_mapped_mark, to);
+}
+
+static void build_mark_map(struct string_list *from, struct string_list *to)
+{
+	struct string_list_item *fromp, *top;
+
+	sub_oid_map = kh_init_oid_map();
+
+	for_each_string_list_item(fromp, from) {
+		top = string_list_lookup(to, fromp->string);
+		if (!fromp->util) {
+			die(_("Missing from marks for submodule '%s'"), fromp->string);
+		} else if (!top || !top->util) {
+			die(_("Missing to marks for submodule '%s'"), fromp->string);
+		}
+		build_mark_map_one(fromp->util, top->util);
+	}
+}
+
 static struct object_entry *parse_treeish_dataref(const char **p)
 {
 	struct object_id oid;
 	struct object_entry *e;
 
 	if (**p == ':') {	/* <mark> */
-		e = find_mark(parse_mark_ref_space(p));
+		e = find_mark(marks, parse_mark_ref_space(p));
 		if (!e)
 			die("Unknown mark: %s", command_buf.buf);
 		oidcpy(&oid, &e->idx.oid);
 	} else {	/* <sha1> */
-		if (parse_oid_hex(*p, &oid, p))
+		if (parse_mapped_oid_hex(*p, &oid, p))
 			die("Invalid dataref: %s", command_buf.buf);
 		e = find_object(&oid);
 		if (*(*p)++ != ' ')
@@ -3059,6 +3223,28 @@ static void parse_progress(void)
 	skip_optional_lf();
 }
 
+static void parse_alias(void)
+{
+	struct object_entry *e;
+	struct branch b;
+
+	skip_optional_lf();
+	read_next_command();
+
+	/* mark ... */
+	parse_mark();
+	if (!next_mark)
+		die(_("Expected 'mark' command, got %s"), command_buf.buf);
+
+	/* to ... */
+	memset(&b, 0, sizeof(b));
+	if (!parse_objectish_with_prefix(&b, "to "))
+		die(_("Expected 'to' command, got %s"), command_buf.buf);
+	e = find_object(&b.oid);
+	assert(e);
+	insert_mark(marks, next_mark, e);
+}
+
 static char* make_fast_import_path(const char *path)
 {
 	if (!relative_marks_paths || is_absolute_path(path))
@@ -3079,7 +3265,6 @@ static void option_import_marks(const char *marks,
 	}
 
 	import_marks_file = make_fast_import_path(marks);
-	safe_create_leading_directories_const(import_marks_file);
 	import_marks_file_from_stream = from_stream;
 	import_marks_file_ignore_missing = ignore_missing;
 }
@@ -3088,6 +3273,8 @@ static void option_date_format(const char *fmt)
 {
 	if (!strcmp(fmt, "raw"))
 		whenspec = WHENSPEC_RAW;
+	else if (!strcmp(fmt, "raw-permissive"))
+		whenspec = WHENSPEC_RAW_PERMISSIVE;
 	else if (!strcmp(fmt, "rfc2822"))
 		whenspec = WHENSPEC_RFC2822;
 	else if (!strcmp(fmt, "now"))
@@ -3120,7 +3307,6 @@ static void option_active_branches(const char *branches)
 static void option_export_marks(const char *marks)
 {
 	export_marks_file = make_fast_import_path(marks);
-	safe_create_leading_directories_const(export_marks_file);
 }
 
 static void option_cat_blob_fd(const char *fd)
@@ -3136,6 +3322,26 @@ static void option_export_pack_edges(const char *edges)
 	if (pack_edges)
 		fclose(pack_edges);
 	pack_edges = xfopen(edges, "a");
+}
+
+static void option_rewrite_submodules(const char *arg, struct string_list *list)
+{
+	struct mark_set *ms;
+	FILE *fp;
+	char *s = xstrdup(arg);
+	char *f = strchr(s, ':');
+	if (!f)
+		die(_("Expected format name:filename for submodule rewrite option"));
+	*f = '\0';
+	f++;
+	ms = xcalloc(1, sizeof(*ms));
+	string_list_insert(list, s)->util = ms;
+
+	fp = fopen(f, "r");
+	if (!fp)
+		die_errno("cannot read '%s'", f);
+	read_mark_file(ms, fp, insert_oid_entry);
+	fclose(fp);
 }
 
 static int parse_one_option(const char *option)
@@ -3163,15 +3369,24 @@ static int parse_one_option(const char *option)
 		option_active_branches(option);
 	} else if (skip_prefix(option, "export-pack-edges=", &option)) {
 		option_export_pack_edges(option);
-	} else if (starts_with(option, "quiet")) {
+	} else if (!strcmp(option, "quiet")) {
 		show_stats = 0;
-	} else if (starts_with(option, "stats")) {
+	} else if (!strcmp(option, "stats")) {
 		show_stats = 1;
+	} else if (!strcmp(option, "allow-unsafe-features")) {
+		; /* already handled during early option parsing */
 	} else {
 		return 0;
 	}
 
 	return 1;
+}
+
+static void check_unsafe_feature(const char *feature, int from_stream)
+{
+	if (from_stream && !allow_unsafe_features)
+		die(_("feature '%s' forbidden in input without --allow-unsafe-features"),
+		    feature);
 }
 
 static int parse_one_feature(const char *feature, int from_stream)
@@ -3181,11 +3396,21 @@ static int parse_one_feature(const char *feature, int from_stream)
 	if (skip_prefix(feature, "date-format=", &arg)) {
 		option_date_format(arg);
 	} else if (skip_prefix(feature, "import-marks=", &arg)) {
+		check_unsafe_feature("import-marks", from_stream);
 		option_import_marks(arg, from_stream, 0);
 	} else if (skip_prefix(feature, "import-marks-if-exists=", &arg)) {
+		check_unsafe_feature("import-marks-if-exists", from_stream);
 		option_import_marks(arg, from_stream, 1);
 	} else if (skip_prefix(feature, "export-marks=", &arg)) {
+		check_unsafe_feature(feature, from_stream);
 		option_export_marks(arg);
+	} else if (!strcmp(feature, "alias")) {
+		; /* Don't die - this feature is supported */
+	} else if (skip_prefix(feature, "rewrite-submodules-to=", &arg)) {
+		option_rewrite_submodules(arg, &sub_marks_to);
+	} else if (skip_prefix(feature, "rewrite-submodules-from=", &arg)) {
+		option_rewrite_submodules(arg, &sub_marks_from);
+	} else if (skip_prefix(feature, "rewrite-submodules-from=", &arg)) {
 	} else if (!strcmp(feature, "get-mark")) {
 		; /* Don't die - this feature is supported */
 	} else if (!strcmp(feature, "cat-blob")) {
@@ -3291,6 +3516,7 @@ static void parse_argv(void)
 	seen_data_command = 1;
 	if (import_marks_file)
 		read_marks();
+	build_mark_map(&sub_marks_from, &sub_marks_to);
 }
 
 int cmd_main(int argc, const char **argv)
@@ -3310,6 +3536,22 @@ int cmd_main(int argc, const char **argv)
 	branch_table = xcalloc(branch_table_sz, sizeof(struct branch*));
 	avail_tree_table = xcalloc(avail_tree_table_sz, sizeof(struct avail_tree_content*));
 	marks = mem_pool_calloc(&fi_mem_pool, 1, sizeof(struct mark_set));
+
+	hashmap_init(&object_table, object_entry_hashcmp, NULL, 0);
+
+	/*
+	 * We don't parse most options until after we've seen the set of
+	 * "feature" lines at the start of the stream (which allows the command
+	 * line to override stream data). But we must do an early parse of any
+	 * command-line options that impact how we interpret the feature lines.
+	 */
+	for (i = 1; i < argc; i++) {
+		const char *arg = argv[i];
+		if (*arg != '-' || !strcmp(arg, "--"))
+			break;
+		if (!strcmp(arg, "--allow-unsafe-features"))
+			allow_unsafe_features = 1;
+	}
 
 	global_argc = argc;
 	global_argv = argv;
@@ -3342,6 +3584,8 @@ int cmd_main(int argc, const char **argv)
 			parse_checkpoint();
 		else if (!strcmp("done", command_buf.buf))
 			break;
+		else if (!strcmp("alias", command_buf.buf))
+			parse_alias();
 		else if (starts_with(command_buf.buf, "progress "))
 			parse_progress();
 		else if (skip_prefix(command_buf.buf, "feature ", &v))

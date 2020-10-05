@@ -42,8 +42,16 @@ test_expect_success 'do partial clone 1' '
 
 	test_cmp expect_1.oids observed.oids &&
 	test "$(git -C pc1 config --local core.repositoryformatversion)" = "1" &&
-	test "$(git -C pc1 config --local extensions.partialclone)" = "origin" &&
-	test "$(git -C pc1 config --local core.partialclonefilter)" = "blob:none"
+	test "$(git -C pc1 config --local remote.origin.promisor)" = "true" &&
+	test "$(git -C pc1 config --local remote.origin.partialclonefilter)" = "blob:none"
+'
+
+test_expect_success 'verify that .promisor file contains refs fetched' '
+	ls pc1/.git/objects/pack/pack-*.promisor >promisorlist &&
+	test_line_count = 1 promisorlist &&
+	git -C srv.bare rev-parse --verify HEAD >headhash &&
+	grep "$(cat headhash) HEAD" $(cat promisorlist) &&
+	grep "$(cat headhash) refs/heads/master" $(cat promisorlist)
 '
 
 # checkout master to force dynamic object fetch of blobs at HEAD.
@@ -208,6 +216,25 @@ test_expect_success 'use fsck before and after manually fetching a missing subtr
 	test_cmp unique_types.expected unique_types.observed
 '
 
+test_expect_success 'implicitly construct combine: filter with repeated flags' '
+	GIT_TRACE=$(pwd)/trace git clone --bare \
+		--filter=blob:none --filter=tree:1 \
+		"file://$(pwd)/srv.bare" pc2 &&
+	grep "trace:.* git pack-objects .*--filter=combine:blob:none+tree:1" \
+		trace &&
+	git -C pc2 rev-list --objects --missing=allow-any HEAD >objects &&
+
+	# We should have gotten some root trees.
+	grep " $" objects &&
+	# Should not have gotten any non-root trees or blobs.
+	! grep " ." objects &&
+
+	xargs -n 1 git -C pc2 cat-file -t <objects >types &&
+	sort -u types >unique_types.actual &&
+	test_write_lines commit tree >unique_types.expected &&
+	test_cmp unique_types.expected unique_types.actual
+'
+
 test_expect_success 'partial clone fetches blobs pointed to by refs even if normally filtered out' '
 	rm -rf src dst &&
 	git init src &&
@@ -241,6 +268,160 @@ test_expect_success 'fetch what is specified on CLI even if already promised' '
 	! grep "?$(cat blob)" missing_after
 '
 
+test_expect_success 'setup src repo for sparse filter' '
+	git init sparse-src &&
+	git -C sparse-src config --local uploadpack.allowfilter 1 &&
+	git -C sparse-src config --local uploadpack.allowanysha1inwant 1 &&
+	test_commit -C sparse-src one &&
+	test_commit -C sparse-src two &&
+	echo /one.t >sparse-src/only-one &&
+	git -C sparse-src add . &&
+	git -C sparse-src commit -m "add sparse checkout files"
+'
+
+test_expect_success 'partial clone with sparse filter succeeds' '
+	rm -rf dst.git &&
+	git clone --no-local --bare \
+		  --filter=sparse:oid=master:only-one \
+		  sparse-src dst.git &&
+	(
+		cd dst.git &&
+		git rev-list --objects --missing=print HEAD >out &&
+		grep "^$(git rev-parse HEAD:one.t)" out &&
+		grep "^?$(git rev-parse HEAD:two.t)" out
+	)
+'
+
+test_expect_success 'partial clone with unresolvable sparse filter fails cleanly' '
+	rm -rf dst.git &&
+	test_must_fail git clone --no-local --bare \
+				 --filter=sparse:oid=master:no-such-name \
+				 sparse-src dst.git 2>err &&
+	test_i18ngrep "unable to access sparse blob in .master:no-such-name" err &&
+	test_must_fail git clone --no-local --bare \
+				 --filter=sparse:oid=master \
+				 sparse-src dst.git 2>err &&
+	test_i18ngrep "unable to parse sparse filter data in" err
+'
+
+setup_triangle () {
+	rm -rf big-blob.txt server client promisor-remote &&
+
+	printf "line %d\n" $(test_seq 1 100) >big-blob.txt &&
+
+	# Create a server with 2 commits: a commit with a big tree and a child
+	# commit with an incremental change. Also, create a partial clone
+	# client that only contains the first commit.
+	git init server &&
+	git -C server config --local uploadpack.allowfilter 1 &&
+	for i in $(test_seq 1 100)
+	do
+		echo "make the tree big" >server/file$i &&
+		git -C server add file$i
+	done &&
+	git -C server commit -m "initial" &&
+	git clone --bare --filter=tree:0 "file://$(pwd)/server" client &&
+	echo another line >>server/file1 &&
+	git -C server commit -am "incremental change" &&
+
+	# Create a promisor remote that only contains the tree and blob from
+	# the first commit.
+	git init promisor-remote &&
+	git -C server config --local uploadpack.allowanysha1inwant 1 &&
+	TREE_HASH=$(git -C server rev-parse HEAD~1^{tree}) &&
+	git -C promisor-remote fetch --keep "file://$(pwd)/server" "$TREE_HASH" &&
+	git -C promisor-remote count-objects -v >object-count &&
+	test_i18ngrep "count: 0" object-count &&
+	test_i18ngrep "in-pack: 2" object-count &&
+
+	# Set it as the promisor remote of client. Thus, whenever
+	# the client lazy fetches, the lazy fetch will succeed only if it is
+	# for this tree or blob.
+	test_commit -C promisor-remote one && # so that ref advertisement is not empty
+	git -C promisor-remote config --local uploadpack.allowanysha1inwant 1 &&
+	git -C client remote set-url origin "file://$(pwd)/promisor-remote"
+}
+
+# NEEDSWORK: The tests beginning with "fetch lazy-fetches" below only
+# test that "fetch" avoid fetching trees and blobs, but not commits or
+# tags. Revisit this if Git is ever taught to support partial clones
+# with commits and/or tags filtered out.
+
+test_expect_success 'fetch lazy-fetches only to resolve deltas' '
+	setup_triangle &&
+
+	# Exercise to make sure it works. Git will not fetch anything from the
+	# promisor remote other than for the big tree (because it needs to
+	# resolve the delta).
+	GIT_TRACE_PACKET="$(pwd)/trace" git -C client \
+		fetch "file://$(pwd)/server" master &&
+
+	# Verify the assumption that the client needed to fetch the delta base
+	# to resolve the delta.
+	git -C server rev-parse HEAD~1^{tree} >hash &&
+	grep "want $(cat hash)" trace
+'
+
+test_expect_success 'fetch lazy-fetches only to resolve deltas, protocol v2' '
+	setup_triangle &&
+
+	git -C server config --local protocol.version 2 &&
+	git -C client config --local protocol.version 2 &&
+	git -C promisor-remote config --local protocol.version 2 &&
+
+	# Exercise to make sure it works. Git will not fetch anything from the
+	# promisor remote other than for the big blob (because it needs to
+	# resolve the delta).
+	GIT_TRACE_PACKET="$(pwd)/trace" git -C client \
+		fetch "file://$(pwd)/server" master &&
+
+	# Verify that protocol version 2 was used.
+	grep "fetch< version 2" trace &&
+
+	# Verify the assumption that the client needed to fetch the delta base
+	# to resolve the delta.
+	git -C server rev-parse HEAD~1^{tree} >hash &&
+	grep "want $(cat hash)" trace
+'
+
+# The following two tests must be in this order. It is important that
+# the srv.bare repository did not have tags during clone, but has tags
+# in the fetch.
+
+test_expect_success 'verify fetch succeeds when asking for new tags' '
+	git clone --filter=blob:none "file://$(pwd)/srv.bare" tag-test &&
+	for i in I J K
+	do
+		test_commit -C src $i &&
+		git -C src branch $i || return 1
+	done &&
+	git -C srv.bare fetch --tags origin +refs/heads/*:refs/heads/* &&
+	git -C tag-test -c protocol.version=2 fetch --tags origin
+'
+
+test_expect_success 'verify fetch downloads only one pack when updating refs' '
+	git clone --filter=blob:none "file://$(pwd)/srv.bare" pack-test &&
+	ls pack-test/.git/objects/pack/*pack >pack-list &&
+	test_line_count = 2 pack-list &&
+	for i in A B C
+	do
+		test_commit -C src $i &&
+		git -C src branch $i || return 1
+	done &&
+	git -C srv.bare fetch origin +refs/heads/*:refs/heads/* &&
+	git -C pack-test fetch origin &&
+	ls pack-test/.git/objects/pack/*pack >pack-list &&
+	test_line_count = 3 pack-list
+'
+
+test_expect_success 'single-branch tag following respects partial clone' '
+	git clone --single-branch -b B --filter=blob:none \
+		"file://$(pwd)/srv.bare" single &&
+	git -C single rev-parse --verify refs/tags/B &&
+	git -C single rev-parse --verify refs/tags/A &&
+	test_must_fail git -C single rev-parse --verify refs/tags/C
+'
+
 . "$TEST_DIRECTORY"/lib-httpd.sh
 start_httpd
 
@@ -255,14 +436,18 @@ intersperse () {
 	sed 's/\(..\)/'$1'\1/g'
 }
 
-# Create a one-time-sed command to replace the existing packfile with $1.
+# Create a one-time-perl command to replace the existing packfile with $1.
 replace_packfile () {
 	# The protocol requires that the packfile be sent in sideband 1, hence
 	# the extra \x01 byte at the beginning.
-	printf "1,/packfile/!c %04x\\\\x01%s0000" \
-		"$(($(wc -c <$1) + 5))" \
-		"$(hex_unpack <$1 | intersperse '\\x')" \
-		>"$HTTPD_ROOT_PATH/one-time-sed"
+	cp $1 "$HTTPD_ROOT_PATH/one-time-pack" &&
+	echo 'if (/packfile/) {
+		print;
+		my $length = -s "one-time-pack";
+		printf "%04x\x01", $length + 5;
+		print `cat one-time-pack` . "0000";
+		last
+	}' >"$HTTPD_ROOT_PATH/one-time-perl"
 }
 
 test_expect_success 'upon cloning, check that all refs point to objects' '
@@ -286,16 +471,16 @@ test_expect_success 'upon cloning, check that all refs point to objects' '
 	# \x01 byte at the beginning.
 	replace_packfile incomplete.pack &&
 
-	# Use protocol v2 because the sed command looks for the "packfile"
+	# Use protocol v2 because the perl command looks for the "packfile"
 	# section header.
 	test_config -C "$SERVER" protocol.version 2 &&
 	test_must_fail git -c protocol.version=2 clone \
-		--filter=blob:none $HTTPD_URL/one_time_sed/server repo 2>err &&
+		--filter=blob:none $HTTPD_URL/one_time_perl/server repo 2>err &&
 
 	test_i18ngrep "did not send all necessary objects" err &&
 
-	# Ensure that the one-time-sed script was used.
-	! test -e "$HTTPD_ROOT_PATH/one-time-sed"
+	# Ensure that the one-time-perl script was used.
+	! test -e "$HTTPD_ROOT_PATH/one-time-perl"
 '
 
 test_expect_success 'when partial cloning, tolerate server not sending target of tag' '
@@ -326,17 +511,17 @@ test_expect_success 'when partial cloning, tolerate server not sending target of
 	# \x01 byte at the beginning.
 	replace_packfile incomplete.pack &&
 
-	# Use protocol v2 because the sed command looks for the "packfile"
+	# Use protocol v2 because the perl command looks for the "packfile"
 	# section header.
 	test_config -C "$SERVER" protocol.version 2 &&
 
 	# Exercise to make sure it works.
 	git -c protocol.version=2 clone \
-		--filter=blob:none $HTTPD_URL/one_time_sed/server repo 2> err &&
+		--filter=blob:none $HTTPD_URL/one_time_perl/server repo 2> err &&
 	! grep "missing object referenced by" err &&
 
-	# Ensure that the one-time-sed script was used.
-	! test -e "$HTTPD_ROOT_PATH/one-time-sed"
+	# Ensure that the one-time-perl script was used.
+	! test -e "$HTTPD_ROOT_PATH/one-time-perl"
 '
 
 test_expect_success 'tolerate server sending REF_DELTA against missing promisor objects' '
@@ -359,7 +544,7 @@ test_expect_success 'tolerate server sending REF_DELTA against missing promisor 
 
 	# Clone. The client has deltabase_have but not deltabase_missing.
 	git -c protocol.version=2 clone --no-checkout \
-		--filter=blob:none $HTTPD_URL/one_time_sed/server repo &&
+		--filter=blob:none $HTTPD_URL/one_time_perl/server repo &&
 	git -C repo hash-object -w -- "$SERVER/have.txt" &&
 
 	# Sanity check to ensure that the client does not have
@@ -400,7 +585,7 @@ test_expect_success 'tolerate server sending REF_DELTA against missing promisor 
 
 	replace_packfile thin.pack &&
 
-	# Use protocol v2 because the sed command looks for the "packfile"
+	# Use protocol v2 because the perl command looks for the "packfile"
 	# section header.
 	test_config -C "$SERVER" protocol.version 2 &&
 
@@ -413,8 +598,11 @@ test_expect_success 'tolerate server sending REF_DELTA against missing promisor 
 	grep "want $(cat deltabase_missing)" trace &&
 	! grep "want $(cat deltabase_have)" trace &&
 
-	# Ensure that the one-time-sed script was used.
-	! test -e "$HTTPD_ROOT_PATH/one-time-sed"
+	# Ensure that the one-time-perl script was used.
+	! test -e "$HTTPD_ROOT_PATH/one-time-perl"
 '
+
+# DO NOT add non-httpd-specific tests here, because the last part of this
+# test script is only executed when httpd is available and enabled.
 
 test_done

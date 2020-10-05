@@ -71,10 +71,10 @@ test_expect_success 'prepare for rebase conflicts' '
 '
 
 
-test_expect_success 'status when rebase in progress before resolving conflicts' '
+test_expect_success 'status when rebase --apply in progress before resolving conflicts' '
 	test_when_finished "git rebase --abort" &&
 	ONTO=$(git rev-parse --short HEAD^^) &&
-	test_must_fail git rebase HEAD^ --onto HEAD^^ &&
+	test_must_fail git rebase --apply HEAD^ --onto HEAD^^ &&
 	cat >expected <<EOF &&
 rebase in progress; onto $ONTO
 You are currently rebasing branch '\''rebase_conflicts'\'' on '\''$ONTO'\''.
@@ -94,11 +94,11 @@ EOF
 '
 
 
-test_expect_success 'status when rebase in progress before rebase --continue' '
+test_expect_success 'status when rebase --apply in progress before rebase --continue' '
 	git reset --hard rebase_conflicts &&
 	test_when_finished "git rebase --abort" &&
 	ONTO=$(git rev-parse --short HEAD^^) &&
-	test_must_fail git rebase HEAD^ --onto HEAD^^ &&
+	test_must_fail git rebase --apply HEAD^ --onto HEAD^^ &&
 	echo three >main.txt &&
 	git add main.txt &&
 	cat >expected <<EOF &&
@@ -688,7 +688,7 @@ EOF
 '
 
 
-test_expect_success 'status when rebase conflicts with statushints disabled' '
+test_expect_success 'status when rebase --apply conflicts with statushints disabled' '
 	git reset --hard master &&
 	git checkout -b statushints_disabled &&
 	test_when_finished "git config --local advice.statushints true" &&
@@ -698,7 +698,7 @@ test_expect_success 'status when rebase conflicts with statushints disabled' '
 	test_commit three_statushints main.txt three &&
 	test_when_finished "git rebase --abort" &&
 	ONTO=$(git rev-parse --short HEAD^^) &&
-	test_must_fail git rebase HEAD^ --onto HEAD^^ &&
+	test_must_fail git rebase --apply HEAD^ --onto HEAD^^ &&
 	cat >expected <<EOF &&
 rebase in progress; onto $ONTO
 You are currently rebasing branch '\''statushints_disabled'\'' on '\''$ONTO'\''.
@@ -733,6 +733,7 @@ test_expect_success 'status when cherry-picking before resolving conflicts' '
 On branch cherry_branch
 You are currently cherry-picking commit $TO_CHERRY_PICK.
   (fix conflicts and run "git cherry-pick --continue")
+  (use "git cherry-pick --skip" to skip this patch)
   (use "git cherry-pick --abort" to cancel the cherry-pick operation)
 
 Unmerged paths:
@@ -757,6 +758,7 @@ test_expect_success 'status when cherry-picking after resolving conflicts' '
 On branch cherry_branch
 You are currently cherry-picking commit $TO_CHERRY_PICK.
   (all conflicts fixed: run "git cherry-pick --continue")
+  (use "git cherry-pick --skip" to skip this patch)
   (use "git cherry-pick --abort" to cancel the cherry-pick operation)
 
 Changes to be committed:
@@ -778,6 +780,7 @@ test_expect_success 'status when cherry-picking after committing conflict resolu
 On branch cherry_branch
 Cherry-pick currently in progress.
   (run "git cherry-pick --continue" to continue)
+  (use "git cherry-pick --skip" to skip this patch)
   (use "git cherry-pick --abort" to cancel the cherry-pick operation)
 
 nothing to commit (use -u to show untracked files)
@@ -835,6 +838,7 @@ test_expect_success 'status while reverting commit (conflicts)' '
 On branch master
 You are currently reverting commit $TO_REVERT.
   (fix conflicts and run "git revert --continue")
+  (use "git revert --skip" to skip this patch)
   (use "git revert --abort" to cancel the revert operation)
 
 Unmerged paths:
@@ -855,6 +859,7 @@ test_expect_success 'status while reverting commit (conflicts resolved)' '
 On branch master
 You are currently reverting commit $TO_REVERT.
   (all conflicts fixed: run "git revert --continue")
+  (use "git revert --skip" to skip this patch)
   (use "git revert --abort" to cancel the revert operation)
 
 Changes to be committed:
@@ -887,6 +892,7 @@ test_expect_success 'status while reverting after committing conflict resolution
 On branch master
 Revert currently in progress.
   (run "git revert --continue" to continue)
+  (use "git revert --skip" to skip this patch)
   (use "git revert --abort" to cancel the revert operation)
 
 nothing to commit (use -u to show untracked files)

@@ -94,24 +94,8 @@
  * command.
  */
 
-#define DEFAULT_MERGE_LOG_LEN 20
-
 extern const char git_usage_string[];
 extern const char git_more_info_string[];
-
-#define PRUNE_PACKED_DRY_RUN 01
-#define PRUNE_PACKED_VERBOSE 02
-
-void prune_packed_objects(int);
-
-struct fmt_merge_msg_opts {
-	unsigned add_title:1,
-		credit_people:1;
-	int shortlog_len;
-};
-
-int fmt_merge_msg(struct strbuf *in, struct strbuf *out,
-		  struct fmt_merge_msg_opts *);
 
 /**
  * If a built-in has DELAY_PAGER_CONFIG set, the built-in should call this early
@@ -225,6 +209,7 @@ int cmd_shortlog(int argc, const char **argv, const char *prefix);
 int cmd_show(int argc, const char **argv, const char *prefix);
 int cmd_show_branch(int argc, const char **argv, const char *prefix);
 int cmd_show_index(int argc, const char **argv, const char *prefix);
+int cmd_sparse_checkout(int argc, const char **argv, const char *prefix);
 int cmd_status(int argc, const char **argv, const char *prefix);
 int cmd_stash(int argc, const char **argv, const char *prefix);
 int cmd_stripspace(int argc, const char **argv, const char *prefix);

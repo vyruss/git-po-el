@@ -1228,7 +1228,7 @@ sub process_address_list {
 # domain name that corresponds the IP address in the HELO/EHLO
 # handshake. This is used to verify the connection and prevent
 # spammers from trying to hide their identity. If the DNS and IP don't
-# match, the receiveing MTA may deny the connection.
+# match, the receiving MTA may deny the connection.
 #
 # Here is a deny example of Net::SMTP with the default "localhost.localdomain"
 #
@@ -1699,10 +1699,14 @@ sub process_file {
 				$xfer_encoding = $1 if not defined $xfer_encoding;
 			}
 			elsif (/^In-Reply-To: (.*)/i) {
-				$in_reply_to = $1;
+				if (!$initial_in_reply_to || $thread) {
+					$in_reply_to = $1;
+				}
 			}
 			elsif (/^References: (.*)/i) {
-				$references = $1;
+				if (!$initial_in_reply_to || $thread) {
+					$references = $1;
+				}
 			}
 			elsif (!/^Date:\s/i && /^[-A-Za-z]+:\s+\S/) {
 				push @xh, $_;

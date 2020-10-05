@@ -124,6 +124,11 @@ int push_unpushed_submodules(struct repository *r,
  */
 int submodule_to_gitdir(struct strbuf *buf, const char *submodule);
 
+/*
+ * Make sure that no submodule's git dir is nested in a sibling submodule's.
+ */
+int validate_submodule_git_dir(char *git_dir, const char *submodule_name);
+
 #define SUBMODULE_MOVE_HEAD_DRY_RUN (1<<0)
 #define SUBMODULE_MOVE_HEAD_FORCE   (1<<1)
 int submodule_move_head(const char *path,
@@ -147,8 +152,8 @@ void absorb_git_dir_into_superproject(const char *path,
 /*
  * Return the absolute path of the working tree of the superproject, which this
  * project is a submodule of. If this repository is not a submodule of
- * another repository, return NULL.
+ * another repository, return 0.
  */
-const char *get_superproject_working_tree(void);
+int get_superproject_working_tree(struct strbuf *buf);
 
 #endif

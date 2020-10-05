@@ -7,9 +7,6 @@ test_description='Various diff formatting options'
 
 . ./test-lib.sh
 
-LF='
-'
-
 test_expect_success setup '
 
 	GIT_AUTHOR_DATE="2006-06-26 00:00:00 +0000" &&
@@ -98,6 +95,15 @@ test_expect_success setup '
 	git commit -m "update mode" &&
 	git checkout -f master &&
 
+	GIT_AUTHOR_DATE="2006-06-26 00:06:00 +0000" &&
+	GIT_COMMITTER_DATE="2006-06-26 00:06:00 +0000" &&
+	export GIT_AUTHOR_DATE GIT_COMMITTER_DATE &&
+	git checkout -b note initial &&
+	git update-index --chmod=+x file2 &&
+	git commit -m "update mode (file2)" &&
+	git notes add -m "note" &&
+	git checkout -f master &&
+
 	# Same merge as master, but with parents reversed. Hide it in a
 	# pseudo-ref to avoid impacting tests with --all.
 	commit=$(echo reverse |
@@ -111,17 +117,41 @@ test_expect_success setup '
 
 : <<\EOF
 ! [initial] Initial
- * [master] Merge branch 'side'
+ * [master] Merge branch 'side' into master
   ! [rearrange] Rearranged lines in dir/sub
    ! [side] Side
 ----
   +  [rearrange] Rearranged lines in dir/sub
- -   [master] Merge branch 'side'
+ -   [master] Merge branch 'side' into master
  * + [side] Side
  *   [master^] Third
  *   [master~2] Second
 +*++ [initial] Initial
 EOF
+
+process_diffs () {
+	_x04="[0-9a-f][0-9a-f][0-9a-f][0-9a-f]" &&
+	_x07="$_x05[0-9a-f][0-9a-f]" &&
+	sed -e "s/$OID_REGEX/$ZERO_OID/g" \
+	    -e "s/From $_x40 /From $ZERO_OID /" \
+	    -e "s/from $_x40)/from $ZERO_OID)/" \
+	    -e "s/commit $_x40\$/commit $ZERO_OID/" \
+	    -e "s/commit $_x40 (/commit $ZERO_OID (/" \
+	    -e "s/$_x40 $_x40 $_x40/$ZERO_OID $ZERO_OID $ZERO_OID/" \
+	    -e "s/$_x40 $_x40 /$ZERO_OID $ZERO_OID /" \
+	    -e "s/^$_x40 $_x40$/$ZERO_OID $ZERO_OID/" \
+	    -e "s/^$_x40 /$ZERO_OID /" \
+	    -e "s/^$_x40$/$ZERO_OID/" \
+	    -e "s/$_x07\.\.$_x07/fffffff..fffffff/g" \
+	    -e "s/$_x07,$_x07\.\.$_x07/fffffff,fffffff..fffffff/g" \
+	    -e "s/$_x07 $_x07 $_x07/fffffff fffffff fffffff/g" \
+	    -e "s/$_x07 $_x07 /fffffff fffffff /g" \
+	    -e "s/Merge: $_x07 $_x07/Merge: fffffff fffffff/g" \
+	    -e "s/$_x07\.\.\./fffffff.../g" \
+	    -e "s/ $_x04\.\.\./ ffff.../g" \
+	    -e "s/ $_x04/ ffff/g" \
+	    "$1"
+}
 
 V=$(git version | sed -e 's/^git version //' -e 's/\./\\./g')
 while read magic cmd
@@ -161,13 +191,15 @@ do
 		} >"$actual" &&
 		if test -f "$expect"
 		then
+			process_diffs "$actual" >actual &&
+			process_diffs "$expect" >expect &&
 			case $cmd in
 			*format-patch* | *-stat*)
-				test_i18ncmp "$expect" "$actual";;
+				test_i18ncmp expect actual;;
 			*)
-				test_cmp "$expect" "$actual";;
+				test_cmp expect actual;;
 			esac &&
-			rm -f "$actual"
+			rm -f "$actual" actual expect
 		else
 			# this is to help developing new tests.
 			cp "$actual" "$expect"
@@ -375,6 +407,9 @@ diff --no-index --raw --no-abbrev dir2 dir
 
 diff-tree --pretty --root --stat --compact-summary initial
 diff-tree --pretty -R --root --stat --compact-summary initial
+diff-tree --pretty note
+diff-tree --pretty --notes note
+diff-tree --format=%N note
 diff-tree --stat --compact-summary initial mode
 diff-tree -R --stat --compact-summary initial mode
 EOF
@@ -386,16 +421,22 @@ test_expect_success 'log -S requires an argument' '
 test_expect_success 'diff --cached on unborn branch' '
 	echo ref: refs/heads/unborn >.git/HEAD &&
 	git diff --cached >result &&
-	test_cmp "$TEST_DIRECTORY/t4013/diff.diff_--cached" result
+	process_diffs result >actual &&
+	process_diffs "$TEST_DIRECTORY/t4013/diff.diff_--cached" >expected &&
+	test_cmp expected actual
 '
 
 test_expect_success 'diff --cached -- file on unborn branch' '
 	git diff --cached -- file0 >result &&
-	test_cmp "$TEST_DIRECTORY/t4013/diff.diff_--cached_--_file0" result
+	process_diffs result >actual &&
+	process_diffs "$TEST_DIRECTORY/t4013/diff.diff_--cached_--_file0" >expected &&
+	test_cmp expected actual
 '
 test_expect_success 'diff --line-prefix with spaces' '
 	git diff --line-prefix="| | | " --cached -- file0 >result &&
-	test_cmp "$TEST_DIRECTORY/t4013/diff.diff_--line-prefix_--cached_--_file0" result
+	process_diffs result >actual &&
+	process_diffs "$TEST_DIRECTORY/t4013/diff.diff_--line-prefix_--cached_--_file0" >expected &&
+	test_cmp expected actual
 '
 
 test_expect_success 'diff-tree --stdin with log formatting' '

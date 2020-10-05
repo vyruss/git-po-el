@@ -68,8 +68,7 @@ static void rehash_objects(struct packing_data *pdata)
 }
 
 struct object_entry *packlist_find(struct packing_data *pdata,
-				   const struct object_id *oid,
-				   uint32_t *index_pos)
+				   const struct object_id *oid)
 {
 	uint32_t i;
 	int found;
@@ -78,9 +77,6 @@ struct object_entry *packlist_find(struct packing_data *pdata,
 		return NULL;
 
 	i = locate_object_entry_hash(pdata, oid, &found);
-
-	if (index_pos)
-		*index_pos = i;
 
 	if (!found)
 		return NULL;
@@ -123,7 +119,10 @@ void oe_map_new_pack(struct packing_data *pack)
 {
 	uint32_t i;
 
-	REALLOC_ARRAY(pack->in_pack, pack->nr_alloc);
+	if (pack->in_pack)
+		BUG("packing_data has already been converted to pack array");
+
+	ALLOC_ARRAY(pack->in_pack, pack->nr_alloc);
 
 	for (i = 0; i < pack->nr_objects; i++)
 		pack->in_pack[i] = oe_in_pack(pack, pack->objects + i);
@@ -153,8 +152,7 @@ void prepare_packing_data(struct repository *r, struct packing_data *pdata)
 }
 
 struct object_entry *packlist_alloc(struct packing_data *pdata,
-				    const unsigned char *sha1,
-				    uint32_t index_pos)
+				    const struct object_id *oid)
 {
 	struct object_entry *new_entry;
 
@@ -177,12 +175,19 @@ struct object_entry *packlist_alloc(struct packing_data *pdata,
 	new_entry = pdata->objects + pdata->nr_objects++;
 
 	memset(new_entry, 0, sizeof(*new_entry));
-	hashcpy(new_entry->idx.oid.hash, sha1);
+	oidcpy(&new_entry->idx.oid, oid);
 
 	if (pdata->index_size * 3 <= pdata->nr_objects * 4)
 		rehash_objects(pdata);
-	else
-		pdata->index[index_pos] = pdata->nr_objects;
+	else {
+		int found;
+		uint32_t pos = locate_object_entry_hash(pdata,
+							&new_entry->idx.oid,
+							&found);
+		if (found)
+			BUG("duplicate object inserted into hash");
+		pdata->index[pos] = pdata->nr_objects;
+	}
 
 	if (pdata->in_pack)
 		pdata->in_pack[pdata->nr_objects - 1] = NULL;
@@ -198,14 +203,14 @@ struct object_entry *packlist_alloc(struct packing_data *pdata,
 
 void oe_set_delta_ext(struct packing_data *pdata,
 		      struct object_entry *delta,
-		      const unsigned char *sha1)
+		      const struct object_id *oid)
 {
 	struct object_entry *base;
 
 	ALLOC_GROW(pdata->ext_bases, pdata->nr_ext + 1, pdata->alloc_ext);
 	base = &pdata->ext_bases[pdata->nr_ext++];
 	memset(base, 0, sizeof(*base));
-	hashcpy(base->idx.oid.hash, sha1);
+	oidcpy(&base->idx.oid, oid);
 
 	/* These flags mark that we are not part of the actual pack output. */
 	base->preferred_base = 1;

@@ -734,15 +734,53 @@ test_expect_success 'reject adding remote with an invalid name' '
 # the last two ones check if the config is updated.
 
 test_expect_success 'rename a remote' '
+	test_config_global remote.pushDefault origin &&
 	git clone one four &&
 	(
 		cd four &&
+		git config branch.master.pushRemote origin &&
 		git remote rename origin upstream &&
 		test -z "$(git for-each-ref refs/remotes/origin)" &&
 		test "$(git symbolic-ref refs/remotes/upstream/HEAD)" = "refs/remotes/upstream/master" &&
 		test "$(git rev-parse upstream/master)" = "$(git rev-parse master)" &&
 		test "$(git config remote.upstream.fetch)" = "+refs/heads/*:refs/remotes/upstream/*" &&
-		test "$(git config branch.master.remote)" = "upstream"
+		test "$(git config branch.master.remote)" = "upstream" &&
+		test "$(git config branch.master.pushRemote)" = "upstream" &&
+		test "$(git config --global remote.pushDefault)" = "origin"
+	)
+'
+
+test_expect_success 'rename a remote renames repo remote.pushDefault' '
+	git clone one four.1 &&
+	(
+		cd four.1 &&
+		git config remote.pushDefault origin &&
+		git remote rename origin upstream &&
+		test "$(git config --local remote.pushDefault)" = "upstream"
+	)
+'
+
+test_expect_success 'rename a remote renames repo remote.pushDefault but ignores global' '
+	test_config_global remote.pushDefault other &&
+	git clone one four.2 &&
+	(
+		cd four.2 &&
+		git config remote.pushDefault origin &&
+		git remote rename origin upstream &&
+		test "$(git config --global remote.pushDefault)" = "other" &&
+		test "$(git config --local remote.pushDefault)" = "upstream"
+	)
+'
+
+test_expect_success 'rename a remote renames repo remote.pushDefault but keeps global' '
+	test_config_global remote.pushDefault origin &&
+	git clone one four.3 &&
+	(
+		cd four.3 &&
+		git config remote.pushDefault origin &&
+		git remote rename origin upstream &&
+		test "$(git config --global remote.pushDefault)" = "origin" &&
+		test "$(git config --local remote.pushDefault)" = "upstream"
 	)
 '
 
@@ -782,6 +820,54 @@ test_expect_success 'rename succeeds with existing remote.<target>.prune' '
 	test_when_finished git config --global --unset remote.upstream.prune &&
 	git config --global remote.upstream.prune true &&
 	git -C four.four remote rename origin upstream
+'
+
+test_expect_success 'remove a remote' '
+	test_config_global remote.pushDefault origin &&
+	git clone one four.five &&
+	(
+		cd four.five &&
+		git config branch.master.pushRemote origin &&
+		git remote remove origin &&
+		test -z "$(git for-each-ref refs/remotes/origin)" &&
+		test_must_fail git config branch.master.remote &&
+		test_must_fail git config branch.master.pushRemote &&
+		test "$(git config --global remote.pushDefault)" = "origin"
+	)
+'
+
+test_expect_success 'remove a remote removes repo remote.pushDefault' '
+	git clone one four.five.1 &&
+	(
+		cd four.five.1 &&
+		git config remote.pushDefault origin &&
+		git remote remove origin &&
+		test_must_fail git config --local remote.pushDefault
+	)
+'
+
+test_expect_success 'remove a remote removes repo remote.pushDefault but ignores global' '
+	test_config_global remote.pushDefault other &&
+	git clone one four.five.2 &&
+	(
+		cd four.five.2 &&
+		git config remote.pushDefault origin &&
+		git remote remove origin &&
+		test "$(git config --global remote.pushDefault)" = "other" &&
+		test_must_fail git config --local remote.pushDefault
+	)
+'
+
+test_expect_success 'remove a remote removes repo remote.pushDefault but keeps global' '
+	test_config_global remote.pushDefault origin &&
+	git clone one four.five.3 &&
+	(
+		cd four.five.3 &&
+		git config remote.pushDefault origin &&
+		git remote remove origin &&
+		test "$(git config --global remote.pushDefault)" = "origin" &&
+		test_must_fail git config --local remote.pushDefault
+	)
 '
 
 cat >remotes_origin <<EOF
@@ -902,7 +988,7 @@ test_expect_success 'remote set-branches' '
 	+refs/heads/maint:refs/remotes/scratch/maint
 	+refs/heads/master:refs/remotes/scratch/master
 	+refs/heads/next:refs/remotes/scratch/next
-	+refs/heads/pu:refs/remotes/scratch/pu
+	+refs/heads/seen:refs/remotes/scratch/seen
 	+refs/heads/t/topic:refs/remotes/scratch/t/topic
 	EOF
 	sort <<-\EOF >expect.setup-ffonly &&
@@ -912,7 +998,7 @@ test_expect_success 'remote set-branches' '
 	sort <<-\EOF >expect.respect-ffonly &&
 	refs/heads/master:refs/remotes/scratch/master
 	+refs/heads/next:refs/remotes/scratch/next
-	+refs/heads/pu:refs/remotes/scratch/pu
+	+refs/heads/seen:refs/remotes/scratch/seen
 	EOF
 
 	git clone .git/ setbranches &&
@@ -930,7 +1016,7 @@ test_expect_success 'remote set-branches' '
 		git config --get-all remote.scratch.fetch >config-result &&
 		sort <config-result >../actual.replace &&
 
-		git remote set-branches --add scratch pu t/topic &&
+		git remote set-branches --add scratch seen t/topic &&
 		git config --get-all remote.scratch.fetch >config-result &&
 		sort <config-result >../actual.add-two &&
 
@@ -942,7 +1028,7 @@ test_expect_success 'remote set-branches' '
 		git config --get-all remote.scratch.fetch >config-result &&
 		sort <config-result >../actual.setup-ffonly &&
 
-		git remote set-branches --add scratch pu &&
+		git remote set-branches --add scratch seen &&
 		git config --get-all remote.scratch.fetch >config-result &&
 		sort <config-result >../actual.respect-ffonly
 	) &&

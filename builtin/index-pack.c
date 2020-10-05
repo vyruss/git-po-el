@@ -14,7 +14,7 @@
 #include "thread-utils.h"
 #include "packfile.h"
 #include "object-store.h"
-#include "fetch-object.h"
+#include "promisor-remote.h"
 
 static const char index_pack_usage[] =
 "git index-pack [-v] [-o <index-file>] [--keep | --keep=<msg>] [--verify] [--strict] (<pack-file> | --stdin [--fix-thin] [<pack-file>])";
@@ -757,7 +757,8 @@ static int check_collison(struct object_entry *entry)
 
 	memset(&data, 0, sizeof(data));
 	data.entry = entry;
-	data.st = open_istream(&entry->idx.oid, &type, &size, NULL);
+	data.st = open_istream(the_repository, &entry->idx.oid, &type, &size,
+			       NULL);
 	if (!data.st)
 		return -1;
 	if (size != entry->size || type != entry->type)
@@ -948,7 +949,7 @@ static void resolve_delta(struct object_entry *delta_obj,
 	free(delta_data);
 	if (!result->data)
 		bad_object(delta_obj->idx.offset, _("failed to apply delta"));
-	hash_object_file(result->data, result->size,
+	hash_object_file(the_hash_algo, result->data, result->size,
 			 type_name(delta_obj->real_type), &delta_obj->idx.oid);
 	sha1_object(result->data, NULL, result->size, delta_obj->real_type,
 		    &delta_obj->idx.oid);
@@ -1003,7 +1004,9 @@ static struct base_data *find_unresolved_deltas_1(struct base_data *base,
 
 		if (!compare_and_swap_type(&child->real_type, OBJ_REF_DELTA,
 					   base->obj->real_type))
-			BUG("child->real_type != OBJ_REF_DELTA");
+			die("REF_DELTA at offset %"PRIuMAX" already resolved (duplicate base %s?)",
+			    (uintmax_t)child->idx.offset,
+			    oid_to_hex(&base->obj->idx.oid));
 
 		resolve_delta(child, base, result);
 		if (base->ref_first == base->ref_last && base->ofs_last == -1)
@@ -1352,7 +1355,7 @@ static void fix_unresolved_deltas(struct hashfile *f)
 		sorted_by_pos[i] = &ref_deltas[i];
 	QSORT(sorted_by_pos, nr_ref_deltas, delta_pos_compare);
 
-	if (repository_format_partial_clone) {
+	if (has_promisor_remote()) {
 		/*
 		 * Prefetch the delta bases.
 		 */
@@ -1365,9 +1368,8 @@ static void fix_unresolved_deltas(struct hashfile *f)
 				continue;
 			oid_array_append(&to_fetch, &d->oid);
 		}
-		if (to_fetch.nr)
-			fetch_objects(repository_format_partial_clone,
-				      to_fetch.oid, to_fetch.nr);
+		promisor_remote_get_direct(the_repository,
+					   to_fetch.oid, to_fetch.nr);
 		oid_array_clear(&to_fetch);
 	}
 
@@ -1383,8 +1385,9 @@ static void fix_unresolved_deltas(struct hashfile *f)
 		if (!base_obj->data)
 			continue;
 
-		if (check_object_signature(&d->oid, base_obj->data,
-				base_obj->size, type_name(type)))
+		if (check_object_signature(the_repository, &d->oid,
+					   base_obj->data, base_obj->size,
+					   type_name(type)))
 			die(_("local object %s is corrupt"), oid_to_hex(&d->oid));
 		base_obj->obj = append_obj_to_pack(f, d->oid.hash,
 					base_obj->data, base_obj->size, type);
@@ -1490,11 +1493,11 @@ static void final(const char *final_pack_name, const char *curr_pack_name,
 	}
 
 	if (!from_stdin) {
-		printf("%s\n", sha1_to_hex(hash));
+		printf("%s\n", hash_to_hex(hash));
 	} else {
 		struct strbuf buf = STRBUF_INIT;
 
-		strbuf_addf(&buf, "%s\t%s\n", report, sha1_to_hex(hash));
+		strbuf_addf(&buf, "%s\t%s\n", report, hash_to_hex(hash));
 		write_or_die(1, buf.buf, buf.len);
 		strbuf_release(&buf);
 
@@ -1552,13 +1555,9 @@ static void read_v2_anomalous_offsets(struct packed_git *p,
 {
 	const uint32_t *idx1, *idx2;
 	uint32_t i;
-	const uint32_t hashwords = the_hash_algo->rawsz / sizeof(uint32_t);
 
 	/* The address of the 4-byte offset table */
-	idx1 = (((const uint32_t *)p->index_data)
-		+ 2 /* 8-byte header */
-		+ 256 /* fan out */
-		+ hashwords * p->num_objects /* object ID table */
+	idx1 = (((const uint32_t *)((const uint8_t *)p->index_data + p->crc_offset))
 		+ p->num_objects /* CRC32 table */
 		);
 
@@ -1668,6 +1667,7 @@ int cmd_index_pack(int argc, const char **argv, const char *prefix)
 	unsigned char pack_hash[GIT_MAX_RAWSZ];
 	unsigned foreign_nr = 1;	/* zero is a "good" value, assume bad */
 	int report_end_of_input = 0;
+	int hash_algo = 0;
 
 	/*
 	 * index-pack never needs to fetch missing objects except when
@@ -1761,6 +1761,11 @@ int cmd_index_pack(int argc, const char **argv, const char *prefix)
 					die(_("bad %s"), arg);
 			} else if (skip_prefix(arg, "--max-input-size=", &arg)) {
 				max_input_size = strtoumax(arg, NULL, 10);
+			} else if (skip_prefix(arg, "--object-format=", &arg)) {
+				hash_algo = hash_algo_by_name(arg);
+				if (hash_algo == GIT_HASH_UNKNOWN)
+					die(_("unknown hash algorithm '%s'"), arg);
+				repo_set_hash_algo(the_repository, hash_algo);
 			} else
 				usage(index_pack_usage);
 			continue;
@@ -1777,6 +1782,8 @@ int cmd_index_pack(int argc, const char **argv, const char *prefix)
 		die(_("--fix-thin cannot be used without --stdin"));
 	if (from_stdin && !startup_info->have_repository)
 		die(_("--stdin requires a git repository"));
+	if (from_stdin && hash_algo)
+		die(_("--object-format cannot be used with --stdin"));
 	if (!index_name && pack_name)
 		index_name = derive_filename(pack_name, "idx", &index_name_buf);
 

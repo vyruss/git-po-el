@@ -40,7 +40,8 @@ static size_t find_end_of_line(char *buffer, unsigned long size)
  * Reads the patches into a string list, with the `util` field being populated
  * as struct object_id (will need to be free()d).
  */
-static int read_patches(const char *range, struct string_list *list)
+static int read_patches(const char *range, struct string_list *list,
+			const struct argv_array *other_arg)
 {
 	struct child_process cp = CHILD_PROCESS_INIT;
 	struct strbuf buf = STRBUF_INIT, contents = STRBUF_INIT;
@@ -52,6 +53,7 @@ static int read_patches(const char *range, struct string_list *list)
 
 	argv_array_pushl(&cp.args, "log", "--no-color", "-p", "--no-merges",
 			"--reverse", "--date-order", "--decorate=no",
+			"--no-prefix",
 			/*
 			 * Choose indicators that are not used anywhere
 			 * else in diffs, but still look reasonable
@@ -60,8 +62,13 @@ static int read_patches(const char *range, struct string_list *list)
 			"--output-indicator-new=>",
 			"--output-indicator-old=<",
 			"--output-indicator-context=#",
-			"--no-abbrev-commit", range,
+			"--no-abbrev-commit",
+			"--pretty=medium",
+			"--notes",
 			NULL);
+	if (other_arg)
+		argv_array_pushv(&cp.args, other_arg->argv);
+	argv_array_push(&cp.args, range);
 	cp.out = -1;
 	cp.no_stdin = 1;
 	cp.git_cmd = 1;
@@ -101,20 +108,34 @@ static int read_patches(const char *range, struct string_list *list)
 			continue;
 		}
 
+		if (!util) {
+			error(_("could not parse first line of `log` output: "
+				"did not start with 'commit ': '%s'"),
+			      line);
+			string_list_clear(list, 1);
+			strbuf_release(&buf);
+			strbuf_release(&contents);
+			finish_command(&cp);
+			return -1;
+		}
+
 		if (starts_with(line, "diff --git")) {
 			struct patch patch = { 0 };
 			struct strbuf root = STRBUF_INIT;
 			int linenr = 0;
+			int orig_len;
 
 			in_header = 0;
 			strbuf_addch(&buf, '\n');
 			if (!util->diff_offset)
 				util->diff_offset = buf.len;
 			line[len - 1] = '\n';
-			len = parse_git_diff_header(&root, &linenr, 1, line,
+			orig_len = len;
+			len = parse_git_diff_header(&root, &linenr, 0, line,
 						    len, size, &patch);
 			if (len < 0)
-				die(_("could not parse git header '%.*s'"), (int)len, line);
+				die(_("could not parse git header '%.*s'"),
+				    orig_len, line);
 			strbuf_addstr(&buf, " ## ");
 			if (patch.is_new > 0)
 				strbuf_addf(&buf, "%s (new)", patch.new_name);
@@ -143,6 +164,12 @@ static int read_patches(const char *range, struct string_list *list)
 				strbuf_addstr(&buf, line);
 				strbuf_addstr(&buf, "\n\n");
 				strbuf_addstr(&buf, " ## Commit message ##\n");
+			} else if (starts_with(line, "Notes") &&
+				   line[strlen(line) - 1] == ':') {
+				strbuf_addstr(&buf, "\n\n");
+				/* strip the trailing colon */
+				strbuf_addf(&buf, " ## %.*s ##\n",
+					    (int)(strlen(line) - 1), line);
 			} else if (starts_with(line, "    ")) {
 				p = line + len - 2;
 				while (isspace(*p) && p >= line)
@@ -217,8 +244,8 @@ static void find_exact_matches(struct string_list *a, struct string_list *b)
 		util->i = i;
 		util->patch = a->items[i].string;
 		util->diff = util->patch + util->diff_offset;
-		hashmap_entry_init(util, strhash(util->diff));
-		hashmap_add(&map, util);
+		hashmap_entry_init(&util->e, strhash(util->diff));
+		hashmap_add(&map, &util->e);
 	}
 
 	/* Now try to find exact matches in b */
@@ -228,8 +255,8 @@ static void find_exact_matches(struct string_list *a, struct string_list *b)
 		util->i = i;
 		util->patch = b->items[i].string;
 		util->diff = util->patch + util->diff_offset;
-		hashmap_entry_init(util, strhash(util->diff));
-		other = hashmap_remove(&map, util, NULL);
+		hashmap_entry_init(&util->e, strhash(util->diff));
+		other = hashmap_remove_entry(&map, util, e, NULL);
 		if (other) {
 			if (other->matching >= 0)
 				BUG("already assigned!");
@@ -239,7 +266,7 @@ static void find_exact_matches(struct string_list *a, struct string_list *b)
 		}
 	}
 
-	hashmap_free(&map, 0);
+	hashmap_free(&map);
 }
 
 static void diffsize_consume(void *data, char *line, unsigned long len)
@@ -495,16 +522,17 @@ static struct strbuf *output_prefix_cb(struct diff_options *opt, void *data)
 
 int show_range_diff(const char *range1, const char *range2,
 		    int creation_factor, int dual_color,
-		    struct diff_options *diffopt)
+		    const struct diff_options *diffopt,
+		    const struct argv_array *other_arg)
 {
 	int res = 0;
 
 	struct string_list branch1 = STRING_LIST_INIT_DUP;
 	struct string_list branch2 = STRING_LIST_INIT_DUP;
 
-	if (read_patches(range1, &branch1))
+	if (read_patches(range1, &branch1, other_arg))
 		res = error(_("could not parse log for '%s'"), range1);
-	if (!res && read_patches(range2, &branch2))
+	if (!res && read_patches(range2, &branch2, other_arg))
 		res = error(_("could not parse log for '%s'"), range2);
 
 	if (!res) {

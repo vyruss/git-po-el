@@ -6,6 +6,7 @@
 test_description='fmt-merge-msg test'
 
 . ./test-lib.sh
+. "$TEST_DIRECTORY/lib-gpg.sh"
 
 test_expect_success setup '
 	echo one >one &&
@@ -73,8 +74,12 @@ test_expect_success setup '
 	apos="'\''"
 '
 
+test_expect_success GPG 'set up a signed tag' '
+	git tag -s -m signed-tag-msg signed-good-tag left
+'
+
 test_expect_success 'message for merging local branch' '
-	echo "Merge branch ${apos}left${apos}" >expected &&
+	echo "Merge branch ${apos}left${apos} into master" >expected &&
 
 	git checkout master &&
 	git fetch . left &&
@@ -83,8 +88,26 @@ test_expect_success 'message for merging local branch' '
 	test_cmp expected actual
 '
 
+test_expect_success GPG 'message for merging local tag signed by good key' '
+	git checkout master &&
+	git fetch . signed-good-tag &&
+	git fmt-merge-msg <.git/FETCH_HEAD >actual 2>&1 &&
+	grep "^Merge tag ${apos}signed-good-tag${apos}" actual &&
+	grep "^# gpg: Signature made" actual &&
+	grep "^# gpg: Good signature from" actual
+'
+
+test_expect_success GPG 'message for merging local tag signed by unknown key' '
+	git checkout master &&
+	git fetch . signed-good-tag &&
+	GNUPGHOME=. git fmt-merge-msg <.git/FETCH_HEAD >actual 2>&1 &&
+	grep "^Merge tag ${apos}signed-good-tag${apos}" actual &&
+	grep "^# gpg: Signature made" actual &&
+	grep -E "^# gpg: Can${apos}t check signature: (public key not found|No public key)" actual
+'
+
 test_expect_success 'message for merging external branch' '
-	echo "Merge branch ${apos}left${apos} of $(pwd)" >expected &&
+	echo "Merge branch ${apos}left${apos} of $(pwd) into master" >expected &&
 
 	git checkout master &&
 	git fetch "$(pwd)" left &&
@@ -95,7 +118,7 @@ test_expect_success 'message for merging external branch' '
 
 test_expect_success '[merge] summary/log configuration' '
 	cat >expected <<-EOF &&
-	Merge branch ${apos}left${apos}
+	Merge branch ${apos}left${apos} into master
 
 	# By Another Author (3) and A U Thor (2)
 	# Via Another Committer
@@ -137,7 +160,7 @@ test_expect_success 'setup FETCH_HEAD' '
 
 test_expect_success 'merge.log=3 limits shortlog length' '
 	cat >expected <<-EOF &&
-	Merge branch ${apos}left${apos}
+	Merge branch ${apos}left${apos} into master
 
 	# By Another Author (3) and A U Thor (2)
 	# Via Another Committer
@@ -154,7 +177,7 @@ test_expect_success 'merge.log=3 limits shortlog length' '
 
 test_expect_success 'merge.log=5 shows all 5 commits' '
 	cat >expected <<-EOF &&
-	Merge branch ${apos}left${apos}
+	Merge branch ${apos}left${apos} into master
 
 	# By Another Author (3) and A U Thor (2)
 	# Via Another Committer
@@ -172,7 +195,7 @@ test_expect_success 'merge.log=5 shows all 5 commits' '
 
 test_expect_success '--log=5 with custom comment character' '
 	cat >expected <<-EOF &&
-	Merge branch ${apos}left${apos}
+	Merge branch ${apos}left${apos} into master
 
 	x By Another Author (3) and A U Thor (2)
 	x Via Another Committer
@@ -189,14 +212,14 @@ test_expect_success '--log=5 with custom comment character' '
 '
 
 test_expect_success 'merge.log=0 disables shortlog' '
-	echo "Merge branch ${apos}left${apos}" >expected &&
+	echo "Merge branch ${apos}left${apos} into master" >expected &&
 	git -c merge.log=0 fmt-merge-msg <.git/FETCH_HEAD >actual &&
 	test_cmp expected actual
 '
 
 test_expect_success '--log=3 limits shortlog length' '
 	cat >expected <<-EOF &&
-	Merge branch ${apos}left${apos}
+	Merge branch ${apos}left${apos} into master
 
 	# By Another Author (3) and A U Thor (2)
 	# Via Another Committer
@@ -213,7 +236,7 @@ test_expect_success '--log=3 limits shortlog length' '
 
 test_expect_success '--log=5 shows all 5 commits' '
 	cat >expected <<-EOF &&
-	Merge branch ${apos}left${apos}
+	Merge branch ${apos}left${apos} into master
 
 	# By Another Author (3) and A U Thor (2)
 	# Via Another Committer
@@ -230,13 +253,13 @@ test_expect_success '--log=5 shows all 5 commits' '
 '
 
 test_expect_success '--no-log disables shortlog' '
-	echo "Merge branch ${apos}left${apos}" >expected &&
+	echo "Merge branch ${apos}left${apos} into master" >expected &&
 	git fmt-merge-msg --no-log <.git/FETCH_HEAD >actual &&
 	test_cmp expected actual
 '
 
 test_expect_success '--log=0 disables shortlog' '
-	echo "Merge branch ${apos}left${apos}" >expected &&
+	echo "Merge branch ${apos}left${apos} into master" >expected &&
 	git fmt-merge-msg --no-log <.git/FETCH_HEAD >actual &&
 	test_cmp expected actual
 '
@@ -277,7 +300,7 @@ test_expect_success 'fmt-merge-msg -m' '
 
 test_expect_success 'setup: expected shortlog for two branches' '
 	cat >expected <<-EOF
-	Merge branches ${apos}left${apos} and ${apos}right${apos}
+	Merge branches ${apos}left${apos} and ${apos}right${apos} into master
 
 	# By Another Author (3) and A U Thor (2)
 	# Via Another Committer
@@ -374,7 +397,7 @@ test_expect_success 'merge-msg with nothing to merge' '
 
 test_expect_success 'merge-msg tag' '
 	cat >expected <<-EOF &&
-	Merge tag ${apos}tag-r3${apos}
+	Merge tag ${apos}tag-r3${apos} into master
 
 	* tag ${apos}tag-r3${apos}:
 	  Right #3
@@ -395,7 +418,7 @@ test_expect_success 'merge-msg tag' '
 
 test_expect_success 'merge-msg two tags' '
 	cat >expected <<-EOF &&
-	Merge tags ${apos}tag-r3${apos} and ${apos}tag-l5${apos}
+	Merge tags ${apos}tag-r3${apos} and ${apos}tag-l5${apos} into master
 
 	* tag ${apos}tag-r3${apos}:
 	  Right #3
@@ -425,7 +448,7 @@ test_expect_success 'merge-msg two tags' '
 
 test_expect_success 'merge-msg tag and branch' '
 	cat >expected <<-EOF &&
-	Merge branch ${apos}left${apos}, tag ${apos}tag-r3${apos}
+	Merge branch ${apos}left${apos}, tag ${apos}tag-r3${apos} into master
 
 	* tag ${apos}tag-r3${apos}:
 	  Right #3
@@ -456,7 +479,7 @@ test_expect_success 'merge-msg tag and branch' '
 test_expect_success 'merge-msg lots of commits' '
 	{
 		cat <<-EOF &&
-		Merge branch ${apos}long${apos}
+		Merge branch ${apos}long${apos} into master
 
 		* long: (35 commits)
 		EOF
@@ -493,7 +516,7 @@ test_expect_success 'merge-msg with "merging" an annotated tag' '
 	git fmt-merge-msg <.git/FETCH_HEAD >actual &&
 	{
 		cat <<-\EOF
-		Merge tag '\''annote'\''
+		Merge tag '\''annote'\'' into master
 
 		An annotated one
 
@@ -508,7 +531,7 @@ test_expect_success 'merge-msg with "merging" an annotated tag' '
 	git merge --no-commit --no-ff $annote &&
 	{
 		cat <<-EOF
-		Merge tag '\''$annote'\''
+		Merge tag '\''$annote'\'' into master
 
 		An annotated one
 

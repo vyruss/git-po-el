@@ -4,6 +4,7 @@
 #include "help.h"
 #include "run-command.h"
 #include "alias.h"
+#include "shallow.h"
 
 #define RUN_SETUP		(1<<0)
 #define RUN_SETUP_GENTLY	(1<<1)
@@ -351,6 +352,7 @@ static int handle_alias(int *argcp, const char ***argv)
 
 			trace2_cmd_alias(alias_command, child.args.argv);
 			trace2_cmd_list_config();
+			trace2_cmd_list_env_vars();
 			trace2_cmd_name("_run_shell_alias_");
 
 			ret = run_command(&child);
@@ -369,8 +371,7 @@ static int handle_alias(int *argcp, const char ***argv)
 			die(_("alias '%s' changes environment variables.\n"
 			      "You can use '!git' in the alias to do this"),
 			    alias_command);
-		memmove(new_argv - option_count, new_argv,
-				count * sizeof(char *));
+		MOVE_ARRAY(new_argv - option_count, new_argv, count);
 		new_argv -= option_count;
 
 		if (count < 1)
@@ -385,10 +386,11 @@ static int handle_alias(int *argcp, const char ***argv)
 
 		REALLOC_ARRAY(new_argv, count + *argcp);
 		/* insert after command name */
-		memcpy(new_argv + count, *argv + 1, sizeof(char *) * *argcp);
+		COPY_ARRAY(new_argv + count, *argv + 1, *argcp);
 
 		trace2_cmd_alias(alias_command, new_argv);
 		trace2_cmd_list_config();
+		trace2_cmd_list_env_vars();
 
 		*argv = new_argv;
 		*argcp += count - 1;
@@ -440,6 +442,7 @@ static int run_builtin(struct cmd_struct *p, int argc, const char **argv)
 	trace_argv_printf(argv, "trace: built-in: git");
 	trace2_cmd_name(p->cmd);
 	trace2_cmd_list_config();
+	trace2_cmd_list_env_vars();
 
 	validate_cache_entries(the_repository->index);
 	status = p->fn(argc, argv, prefix);
@@ -571,15 +574,11 @@ static struct cmd_struct commands[] = {
 	{ "shortlog", cmd_shortlog, RUN_SETUP_GENTLY | USE_PAGER },
 	{ "show", cmd_show, RUN_SETUP },
 	{ "show-branch", cmd_show_branch, RUN_SETUP },
-	{ "show-index", cmd_show_index },
+	{ "show-index", cmd_show_index, RUN_SETUP_GENTLY },
 	{ "show-ref", cmd_show_ref, RUN_SETUP },
+	{ "sparse-checkout", cmd_sparse_checkout, RUN_SETUP | NEED_WORK_TREE },
 	{ "stage", cmd_add, RUN_SETUP | NEED_WORK_TREE },
-	/*
-	 * NEEDSWORK: Until the builtin stash is thoroughly robust and no
-	 * longer needs redirection to the stash shell script this is kept as
-	 * is, then should be changed to RUN_SETUP | NEED_WORK_TREE
-	 */
-	{ "stash", cmd_stash },
+	{ "stash", cmd_stash, RUN_SETUP | NEED_WORK_TREE },
 	{ "status", cmd_status, RUN_SETUP | NEED_WORK_TREE },
 	{ "stripspace", cmd_stripspace },
 	{ "submodule--helper", cmd_submodule__helper, RUN_SETUP | SUPPORT_SUPER_PREFIX | NO_PARSEOPT },

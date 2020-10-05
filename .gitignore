@@ -25,6 +25,7 @@
 /git-bisect--helper
 /git-blame
 /git-branch
+/git-bugreport
 /git-bundle
 /git-cat-file
 /git-check-attr
@@ -83,7 +84,6 @@
 /git-init-db
 /git-interpret-trailers
 /git-instaweb
-/git-legacy-stash
 /git-log
 /git-ls-files
 /git-ls-remote
@@ -158,6 +158,7 @@
 /git-show-branch
 /git-show-index
 /git-show-ref
+/git-sparse-checkout
 /git-stage
 /git-stash
 /git-status
@@ -188,6 +189,7 @@
 /gitweb/gitweb.cgi
 /gitweb/static/gitweb.js
 /gitweb/static/gitweb.min.*
+/config-list.h
 /command-list.h
 *.tar.gz
 *.dsc
@@ -216,6 +218,7 @@
 /tags
 /TAGS
 /cscope*
+*.hcc
 *.obj
 *.lib
 *.res
@@ -231,7 +234,6 @@
 *.ipdb
 *.dll
 .vs/
-*.manifest
 Debug/
 Release/
 /UpgradeLog*.htm

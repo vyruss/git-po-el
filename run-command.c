@@ -213,8 +213,9 @@ static char *locate_in_PATH(const char *file)
 static int exists_in_PATH(const char *file)
 {
 	char *r = locate_in_PATH(file);
+	int found = r != NULL;
 	free(r);
-	return r != NULL;
+	return found;
 }
 
 int sane_execvp(const char *file, char * const argv[])
@@ -412,8 +413,7 @@ static int prepare_cmd(struct argv_array *out, const struct child_process *cmd)
 	argv_array_push(out, SHELL_PATH);
 
 	if (cmd->git_cmd) {
-		argv_array_push(out, "git");
-		argv_array_pushv(out, cmd->argv);
+		prepare_git_cmd(out, cmd->argv);
 	} else if (cmd->use_shell) {
 		prepare_shell_cmd(out, cmd->argv);
 	} else {
@@ -421,12 +421,12 @@ static int prepare_cmd(struct argv_array *out, const struct child_process *cmd)
 	}
 
 	/*
-	 * If there are no '/' characters in the command then perform a path
-	 * lookup and use the resolved path as the command to exec.  If there
-	 * are '/' characters, we have exec attempt to invoke the command
-	 * directly.
+	 * If there are no dir separator characters in the command then perform
+	 * a path lookup and use the resolved path as the command to exec. If
+	 * there are dir separator characters, we have exec attempt to invoke
+	 * the command directly.
 	 */
-	if (!strchr(out->argv[1], '/')) {
+	if (!has_dir_sep(out->argv[1])) {
 		char *program = locate_in_PATH(out->argv[1]);
 		if (program) {
 			free((char *)out->argv[1]);
@@ -1863,4 +1863,17 @@ int run_processes_parallel_tr2(int n, get_next_task_fn get_next_task,
 	trace2_region_leave(tr2_category, tr2_label, NULL);
 
 	return result;
+}
+
+int run_auto_gc(int quiet)
+{
+	struct argv_array argv_gc_auto = ARGV_ARRAY_INIT;
+	int status;
+
+	argv_array_pushl(&argv_gc_auto, "gc", "--auto", NULL);
+	if (quiet)
+		argv_array_push(&argv_gc_auto, "--quiet");
+	status = run_command_v_opt(argv_gc_auto.argv, RUN_GIT_CMD);
+	argv_array_clear(&argv_gc_auto);
+	return status;
 }

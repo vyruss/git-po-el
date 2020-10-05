@@ -34,10 +34,9 @@ test_expect_success setup '
 	remove_progress_re="$(printf "s/.*\\r//")"
 '
 
-create_expected_success_am () {
+create_expected_success_apply () {
 	cat >expected <<-EOF
 	$(grep "^Created autostash: [0-9a-f][0-9a-f]*\$" actual)
-	HEAD is now at $(git rev-parse --short feature-branch) third commit
 	First, rewinding head to replay your work on top of it...
 	Applying: second commit
 	Applying: third commit
@@ -45,19 +44,17 @@ create_expected_success_am () {
 	EOF
 }
 
-create_expected_success_interactive () {
+create_expected_success_merge () {
 	q_to_cr >expected <<-EOF
 	$(grep "^Created autostash: [0-9a-f][0-9a-f]*\$" actual)
-	HEAD is now at $(git rev-parse --short feature-branch) third commit
 	Applied autostash.
 	Successfully rebased and updated refs/heads/rebased-feature-branch.
 	EOF
 }
 
-create_expected_failure_am () {
+create_expected_failure_apply () {
 	cat >expected <<-EOF
 	$(grep "^Created autostash: [0-9a-f][0-9a-f]*\$" actual)
-	HEAD is now at $(git rev-parse --short feature-branch) third commit
 	First, rewinding head to replay your work on top of it...
 	Applying: second commit
 	Applying: third commit
@@ -67,10 +64,9 @@ create_expected_failure_am () {
 	EOF
 }
 
-create_expected_failure_interactive () {
+create_expected_failure_merge () {
 	cat >expected <<-EOF
 	$(grep "^Created autostash: [0-9a-f][0-9a-f]*\$" actual)
-	HEAD is now at $(git rev-parse --short feature-branch) third commit
 	Applying autostash resulted in conflicts.
 	Your changes are safe in the stash.
 	You can run "git stash pop" or "git stash drop" at any time.
@@ -105,9 +101,9 @@ testrebase () {
 
 	test_expect_success "rebase$type --autostash: check output" '
 		test_when_finished git branch -D rebased-feature-branch &&
-		suffix=${type#\ --} && suffix=${suffix:-am} &&
-		if test ${suffix} = "merge"; then
-			suffix=interactive
+		suffix=${type#\ --} && suffix=${suffix:-apply} &&
+		if test ${suffix} = "interactive"; then
+			suffix=merge
 		fi &&
 		create_expected_success_$suffix &&
 		sed "$remove_progress_re" <actual >actual2 &&
@@ -188,6 +184,26 @@ testrebase () {
 		git checkout feature-branch
 	'
 
+	test_expect_success "rebase$type: --quit" '
+		test_config rebase.autostash true &&
+		git reset --hard &&
+		git checkout -b rebased-feature-branch feature-branch &&
+		test_when_finished git branch -D rebased-feature-branch &&
+		echo dirty >>file3 &&
+		git diff >expect &&
+		test_must_fail git rebase$type related-onto-branch &&
+		test_path_is_file $dotest/autostash &&
+		test_path_is_missing file3 &&
+		git rebase --quit &&
+		test_when_finished git stash drop &&
+		test_path_is_missing $dotest/autostash &&
+		! grep dirty file3 &&
+		git stash show -p >actual &&
+		test_cmp expect actual &&
+		git reset --hard &&
+		git checkout feature-branch
+	'
+
 	test_expect_success "rebase$type: non-conflicting rebase, conflicting stash" '
 		test_config rebase.autostash true &&
 		git reset --hard &&
@@ -206,9 +222,9 @@ testrebase () {
 
 	test_expect_success "rebase$type: check output with conflicting stash" '
 		test_when_finished git branch -D rebased-feature-branch &&
-		suffix=${type#\ --} && suffix=${suffix:-am} &&
-		if test ${suffix} = "merge"; then
-			suffix=interactive
+		suffix=${type#\ --} && suffix=${suffix:-apply} &&
+		if test ${suffix} = "interactive"; then
+			suffix=merge
 		fi &&
 		create_expected_failure_$suffix &&
 		sed "$remove_progress_re" <actual >actual2 &&
@@ -238,7 +254,7 @@ test_expect_success "rebase: noop rebase" '
 	git checkout feature-branch
 '
 
-testrebase "" .git/rebase-apply
+testrebase " --apply" .git/rebase-apply
 testrebase " --merge" .git/rebase-merge
 testrebase " --interactive" .git/rebase-merge
 
@@ -304,6 +320,14 @@ test_expect_success 'branch is left alone when possible' '
 	git rebase --autostash unchanged-branch &&
 	test changed = "$(cat file0)" &&
 	test unchanged-branch = "$(git rev-parse --abbrev-ref HEAD)"
+'
+
+test_expect_success 'never change active branch' '
+	git checkout -b not-the-feature-branch unrelated-onto-branch &&
+	test_when_finished "git reset --hard && git checkout master" &&
+	echo changed >file0 &&
+	git rebase --autostash not-the-feature-branch feature-branch &&
+	test_cmp_rev not-the-feature-branch unrelated-onto-branch
 '
 
 test_done

@@ -54,6 +54,7 @@ git-archive                             mainporcelain
 git-bisect                              mainporcelain           info
 git-blame                               ancillaryinterrogators          complete
 git-branch                              mainporcelain           history
+git-bugreport                           ancillaryinterrogators
 git-bundle                              mainporcelain
 git-cat-file                            plumbinginterrogators
 git-check-attr                          purehelpers
@@ -135,7 +136,7 @@ git-pack-redundant                      plumbinginterrogators
 git-pack-refs                           ancillarymanipulators
 git-parse-remote                        synchelpers
 git-patch-id                            purehelpers
-git-prune                               ancillarymanipulators
+git-prune                               ancillarymanipulators   complete
 git-prune-packed                        plumbingmanipulators
 git-pull                                mainporcelain           remote
 git-push                                mainporcelain           remote
@@ -166,6 +167,7 @@ git-show-index                          plumbinginterrogators
 git-show-ref                            plumbinginterrogators
 git-sh-i18n                             purehelpers
 git-sh-setup                            purehelpers
+git-sparse-checkout                     mainporcelain           worktree
 git-stash                               mainporcelain
 git-stage                                                               complete
 git-status                              mainporcelain           info
@@ -196,6 +198,7 @@ gitcore-tutorial                        guide
 gitcvs-migration                        guide
 gitdiffcore                             guide
 giteveryday                             guide
+gitfaq                                  guide
 gitglossary                             guide
 githooks                                guide
 gitignore                               guide
@@ -203,6 +206,7 @@ gitmodules                              guide
 gitnamespaces                           guide
 gitrepository-layout                    guide
 gitrevisions                            guide
+gitsubmodules                           guide
 gittutorial-2                           guide
 gittutorial                             guide
 gitworkflows                            guide

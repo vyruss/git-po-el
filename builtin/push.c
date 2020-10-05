@@ -64,6 +64,7 @@ static struct string_list push_options_config = STRING_LIST_INIT_DUP;
 static const char *map_refspec(const char *ref,
 			       struct remote *remote, struct ref *local_refs)
 {
+	const char *branch_name;
 	struct ref *matched = NULL;
 
 	/* Does "ref" uniquely name our ref? */
@@ -84,8 +85,8 @@ static const char *map_refspec(const char *ref,
 	}
 
 	if (push_default == PUSH_DEFAULT_UPSTREAM &&
-	    starts_with(matched->name, "refs/heads/")) {
-		struct branch *branch = branch_get(matched->name + 11);
+	    skip_prefix(matched->name, "refs/heads/", &branch_name)) {
+		struct branch *branch = branch_get(branch_name);
 		if (branch->merge_nr == 1 && branch->merge[0]->src) {
 			struct strbuf buf = STRBUF_INIT;
 			strbuf_addf(&buf, "%s:%s",
@@ -143,8 +144,8 @@ static int push_url_of_remote(struct remote *remote, const char ***url_p)
 	return remote->url_nr;
 }
 
-static NORETURN int die_push_simple(struct branch *branch,
-				    struct remote *remote)
+static NORETURN void die_push_simple(struct branch *branch,
+				     struct remote *remote)
 {
 	/*
 	 * There's no point in using shorten_unambiguous_ref here,
@@ -339,6 +340,7 @@ static int push_with_options(struct transport *transport, struct refspec *rs,
 {
 	int err;
 	unsigned int reject_reasons;
+	char *anon_url = transport_anonymize_url(transport->url);
 
 	transport_set_verbosity(transport, verbosity, progress);
 	transport->family = family;
@@ -356,16 +358,19 @@ static int push_with_options(struct transport *transport, struct refspec *rs,
 	}
 
 	if (verbosity > 0)
-		fprintf(stderr, _("Pushing to %s\n"), transport->url);
+		fprintf(stderr, _("Pushing to %s\n"), anon_url);
+	trace2_region_enter("push", "transport_push", the_repository);
 	err = transport_push(the_repository, transport,
 			     rs, flags, &reject_reasons);
+	trace2_region_leave("push", "transport_push", the_repository);
 	if (err != 0) {
 		fprintf(stderr, "%s", push_get_color(PUSH_COLOR_ERROR));
-		error(_("failed to push some refs to '%s'"), transport->url);
+		error(_("failed to push some refs to '%s'"), anon_url);
 		fprintf(stderr, "%s", push_get_color(PUSH_COLOR_RESET));
 	}
 
 	err |= transport_disconnect(transport);
+	free(anon_url);
 	if (!err)
 		return 0;
 
@@ -385,29 +390,13 @@ static int push_with_options(struct transport *transport, struct refspec *rs,
 }
 
 static int do_push(const char *repo, int flags,
-		   const struct string_list *push_options)
+		   const struct string_list *push_options,
+		   struct remote *remote)
 {
 	int i, errs;
-	struct remote *remote = pushremote_get(repo);
 	const char **url;
 	int url_nr;
 	struct refspec *push_refspec = &rs;
-
-	if (!remote) {
-		if (repo)
-			die(_("bad repository '%s'"), repo);
-		die(_("No configured push destination.\n"
-		    "Either specify the URL from the command-line or configure a remote repository using\n"
-		    "\n"
-		    "    git remote add <name> <url>\n"
-		    "\n"
-		    "and then push using the remote name\n"
-		    "\n"
-		    "    git push <name>\n"));
-	}
-
-	if (remote->mirror)
-		flags |= (TRANSPORT_PUSH_MIRROR|TRANSPORT_PUSH_FORCE);
 
 	if (push_options->nr)
 		flags |= TRANSPORT_PUSH_OPTIONS;
@@ -447,10 +436,8 @@ static int option_parse_recurse_submodules(const struct option *opt,
 
 	if (unset)
 		*recurse_submodules = RECURSE_SUBMODULES_OFF;
-	else if (arg)
-		*recurse_submodules = parse_push_recurse_submodules_arg(opt->long_name, arg);
 	else
-		die("%s missing parameter", opt->long_name);
+		*recurse_submodules = parse_push_recurse_submodules_arg(opt->long_name, arg);
 
 	return 0;
 }
@@ -548,6 +535,7 @@ int cmd_push(int argc, const char **argv, const char *prefix)
 	struct string_list push_options_cmdline = STRING_LIST_INIT_DUP;
 	struct string_list *push_options;
 	const struct string_list_item *item;
+	struct remote *remote;
 
 	struct option options[] = {
 		OPT__VERBOSITY(&verbosity),
@@ -560,13 +548,11 @@ int cmd_push(int argc, const char **argv, const char *prefix)
 		OPT_BIT('n' , "dry-run", &flags, N_("dry run"), TRANSPORT_PUSH_DRY_RUN),
 		OPT_BIT( 0,  "porcelain", &flags, N_("machine-readable output"), TRANSPORT_PUSH_PORCELAIN),
 		OPT_BIT('f', "force", &flags, N_("force updates"), TRANSPORT_PUSH_FORCE),
-		{ OPTION_CALLBACK,
-		  0, CAS_OPT_NAME, &cas, N_("<refname>:<expect>"),
-		  N_("require old value of ref to be at this value"),
-		  PARSE_OPT_OPTARG | PARSE_OPT_LITERAL_ARGHELP, parseopt_push_cas_option },
-		{ OPTION_CALLBACK, 0, "recurse-submodules", &recurse_submodules, "(check|on-demand|no)",
-			N_("control recursive pushing of submodules"),
-			PARSE_OPT_OPTARG, option_parse_recurse_submodules },
+		OPT_CALLBACK_F(0, CAS_OPT_NAME, &cas, N_("<refname>:<expect>"),
+			       N_("require old value of ref to be at this value"),
+			       PARSE_OPT_OPTARG | PARSE_OPT_LITERAL_ARGHELP, parseopt_push_cas_option),
+		OPT_CALLBACK(0, "recurse-submodules", &recurse_submodules, "(check|on-demand|no)",
+			     N_("control recursive pushing of submodules"), option_parse_recurse_submodules),
 		OPT_BOOL_F( 0 , "thin", &thin, N_("use thin pack"), PARSE_OPT_NOCOMPLETE),
 		OPT_STRING( 0 , "receive-pack", &receivepack, "receive-pack", N_("receive pack program")),
 		OPT_STRING( 0 , "exec", &receivepack, "receive-pack", N_("receive pack program")),
@@ -578,9 +564,8 @@ int cmd_push(int argc, const char **argv, const char *prefix)
 		OPT_BIT(0, "no-verify", &flags, N_("bypass pre-push hook"), TRANSPORT_PUSH_NO_HOOK),
 		OPT_BIT(0, "follow-tags", &flags, N_("push missing but relevant tags"),
 			TRANSPORT_PUSH_FOLLOW_TAGS),
-		{ OPTION_CALLBACK,
-		  0, "signed", &push_cert, "(yes|no|if-asked)", N_("GPG sign the push"),
-		  PARSE_OPT_OPTARG, option_parse_push_signed },
+		OPT_CALLBACK_F(0, "signed", &push_cert, "(yes|no|if-asked)", N_("GPG sign the push"),
+				PARSE_OPT_OPTARG, option_parse_push_signed),
 		OPT_BIT(0, "atomic", &flags, N_("request atomic transaction on remote side"), TRANSPORT_PUSH_ATOMIC),
 		OPT_STRING_LIST('o', "push-option", &push_options_cmdline, N_("server-specific"), N_("option to transmit")),
 		OPT_SET_INT('4', "ipv4", &family, N_("use IPv4 addresses only"),
@@ -602,20 +587,6 @@ int cmd_push(int argc, const char **argv, const char *prefix)
 		die(_("--delete is incompatible with --all, --mirror and --tags"));
 	if (deleterefs && argc < 2)
 		die(_("--delete doesn't make sense without any refs"));
-	if (flags & TRANSPORT_PUSH_ALL) {
-		if (tags)
-			die(_("--all and --tags are incompatible"));
-		if (argc >= 2)
-			die(_("--all can't be combined with refspecs"));
-	}
-	if (flags & TRANSPORT_PUSH_MIRROR) {
-		if (tags)
-			die(_("--mirror and --tags are incompatible"));
-		if (argc >= 2)
-			die(_("--mirror can't be combined with refspecs"));
-	}
-	if ((flags & TRANSPORT_PUSH_ALL) && (flags & TRANSPORT_PUSH_MIRROR))
-		die(_("--all and --mirror are incompatible"));
 
 	if (recurse_submodules == RECURSE_SUBMODULES_CHECK)
 		flags |= TRANSPORT_RECURSE_SUBMODULES_CHECK;
@@ -632,11 +603,43 @@ int cmd_push(int argc, const char **argv, const char *prefix)
 		set_refspecs(argv + 1, argc - 1, repo);
 	}
 
+	remote = pushremote_get(repo);
+	if (!remote) {
+		if (repo)
+			die(_("bad repository '%s'"), repo);
+		die(_("No configured push destination.\n"
+		    "Either specify the URL from the command-line or configure a remote repository using\n"
+		    "\n"
+		    "    git remote add <name> <url>\n"
+		    "\n"
+		    "and then push using the remote name\n"
+		    "\n"
+		    "    git push <name>\n"));
+	}
+
+	if (remote->mirror)
+		flags |= (TRANSPORT_PUSH_MIRROR|TRANSPORT_PUSH_FORCE);
+
+	if (flags & TRANSPORT_PUSH_ALL) {
+		if (tags)
+			die(_("--all and --tags are incompatible"));
+		if (argc >= 2)
+			die(_("--all can't be combined with refspecs"));
+	}
+	if (flags & TRANSPORT_PUSH_MIRROR) {
+		if (tags)
+			die(_("--mirror and --tags are incompatible"));
+		if (argc >= 2)
+			die(_("--mirror can't be combined with refspecs"));
+	}
+	if ((flags & TRANSPORT_PUSH_ALL) && (flags & TRANSPORT_PUSH_MIRROR))
+		die(_("--all and --mirror are incompatible"));
+
 	for_each_string_list_item(item, push_options)
 		if (strchr(item->string, '\n'))
 			die(_("push options must not have new line characters"));
 
-	rc = do_push(repo, flags, push_options);
+	rc = do_push(repo, flags, push_options, remote);
 	string_list_clear(&push_options_cmdline, 0);
 	string_list_clear(&push_options_config, 0);
 	if (rc == -1)

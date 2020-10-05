@@ -56,6 +56,10 @@ Language:	sv (Swedish)
 Repository:	https://github.com/nafmo/git-l10n-sv/
 Leader:		Peter Krefting <peter@softwolves.pp.se>
 
+Language:	tr (Turkish)
+Repository:	https://github.com/bitigchi/git-po/
+Leader:		Emir SARI <bitigchi@me.com>
+
 Language:	vi (Vietnamese)
 Repository:	https://github.com/vnwildman/git/
 Leader:		Trần Ngọc Quân <vnwildman AT gmail.com>
@@ -67,3 +71,8 @@ Leader:		Jiang Xin <worldhello.net AT gmail.com>
 Members:	Ray Chen <oldsharp AT gmail.com>
 		依云 <lilydjwg AT gmail.com>
 		Fangyi Zhou <me AT fangyi.io>
+
+Language:	zh_TW (Traditional Chinese)
+Respository:	https://github.com/l10n-tw/git-po
+Leader: 	Yi-Jyun Pan <pan93412 AT gmail.com>
+Members:	Franklin Weng <franklin AT goodhorse.idv.tw>

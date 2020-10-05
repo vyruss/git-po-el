@@ -479,6 +479,23 @@ void strbuf_addbuf_percentquote(struct strbuf *dst, const struct strbuf *src)
 	}
 }
 
+#define URL_UNSAFE_CHARS " <>\"%{}|\\^`:?#[]@!$&'()*+,;="
+
+void strbuf_add_percentencode(struct strbuf *dst, const char *src, int flags)
+{
+	size_t i, len = strlen(src);
+
+	for (i = 0; i < len; i++) {
+		unsigned char ch = src[i];
+		if (ch <= 0x1F || ch >= 0x7F ||
+		    (ch == '/' && (flags & STRBUF_ENCODE_SLASH)) ||
+		    strchr(URL_UNSAFE_CHARS, ch))
+			strbuf_addf(dst, "%%%02X", (unsigned char)ch);
+		else
+			strbuf_addch(dst, ch);
+	}
+}
+
 size_t strbuf_fread(struct strbuf *sb, size_t size, FILE *f)
 {
 	size_t res;
@@ -538,7 +555,6 @@ ssize_t strbuf_write(struct strbuf *sb, FILE *f)
 {
 	return sb->len ? fwrite(sb->buf, 1, sb->len, f) : 0;
 }
-
 
 #define STRBUF_MAXLINK (2*PATH_MAX)
 
@@ -675,6 +691,16 @@ int strbuf_getwholeline(struct strbuf *sb, FILE *fp, int term)
 }
 #endif
 
+int strbuf_appendwholeline(struct strbuf *sb, FILE *fp, int term)
+{
+	struct strbuf line = STRBUF_INIT;
+	if (strbuf_getwholeline(&line, fp, term))
+		return EOF;
+	strbuf_addbuf(sb, &line);
+	strbuf_release(&line);
+	return 0;
+}
+
 static int strbuf_getdelim(struct strbuf *sb, FILE *fp, int term)
 {
 	if (strbuf_getwholeline(sb, fp, term))
@@ -774,8 +800,10 @@ void strbuf_addstr_xml_quoted(struct strbuf *buf, const char *s)
 	}
 }
 
-static int is_rfc3986_reserved(char ch)
+int is_rfc3986_reserved_or_unreserved(char ch)
 {
+	if (is_rfc3986_unreserved(ch))
+		return 1;
 	switch (ch) {
 		case '!': case '*': case '\'': case '(': case ')': case ';':
 		case ':': case '@': case '&': case '=': case '+': case '$':
@@ -785,20 +813,19 @@ static int is_rfc3986_reserved(char ch)
 	return 0;
 }
 
-static int is_rfc3986_unreserved(char ch)
+int is_rfc3986_unreserved(char ch)
 {
 	return isalnum(ch) ||
 		ch == '-' || ch == '_' || ch == '.' || ch == '~';
 }
 
 static void strbuf_add_urlencode(struct strbuf *sb, const char *s, size_t len,
-				 int reserved)
+				 char_predicate allow_unencoded_fn)
 {
 	strbuf_grow(sb, len);
 	while (len--) {
 		char ch = *s++;
-		if (is_rfc3986_unreserved(ch) ||
-		    (!reserved && is_rfc3986_reserved(ch)))
+		if (allow_unencoded_fn(ch))
 			strbuf_addch(sb, ch);
 		else
 			strbuf_addf(sb, "%%%02x", (unsigned char)ch);
@@ -806,9 +833,9 @@ static void strbuf_add_urlencode(struct strbuf *sb, const char *s, size_t len,
 }
 
 void strbuf_addstr_urlencode(struct strbuf *sb, const char *s,
-			     int reserved)
+			     char_predicate allow_unencoded_fn)
 {
-	strbuf_add_urlencode(sb, s, strlen(s), reserved);
+	strbuf_add_urlencode(sb, s, strlen(s), allow_unencoded_fn);
 }
 
 static void strbuf_humanise(struct strbuf *buf, off_t bytes,
@@ -1123,4 +1150,32 @@ int strbuf_normalize_path(struct strbuf *src)
 	strbuf_swap(src, &dst);
 	strbuf_release(&dst);
 	return 0;
+}
+
+int strbuf_edit_interactively(struct strbuf *buffer, const char *path,
+			      const char *const *env)
+{
+	char *path2 = NULL;
+	int fd, res = 0;
+
+	if (!is_absolute_path(path))
+		path = path2 = xstrdup(git_path("%s", path));
+
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	if (fd < 0)
+		res = error_errno(_("could not open '%s' for writing"), path);
+	else if (write_in_full(fd, buffer->buf, buffer->len) < 0) {
+		res = error_errno(_("could not write to '%s'"), path);
+		close(fd);
+	} else if (close(fd) < 0)
+		res = error_errno(_("could not close '%s'"), path);
+	else {
+		strbuf_reset(buffer);
+		if (launch_editor(path, buffer, env) < 0)
+			res = error_errno(_("could not edit '%s'"), path);
+		unlink(path);
+	}
+
+	free(path2);
+	return res;
 }
